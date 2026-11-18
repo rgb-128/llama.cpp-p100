@@ -402,6 +402,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("a.rvq.codebook")  == std::string::npos;
     quantize &= name.find("mm.a.code_embd")  == std::string::npos;
 
+    // mHC routing is sensitive to weight quantization.
+    if (arch == LLM_ARCH_SENSENOVA_LOOP) {
+        quantize &= name.find("hc_") == std::string::npos;
+    }
+
     return quantize;
 }
 
