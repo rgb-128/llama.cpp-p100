@@ -2642,8 +2642,11 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
 
         struct routing {
             ggml_tensor * input;
+            ggml_tensor * logits;
+            ggml_tensor * mix;
+            // Retained for LOOP_MHC_UNFUSED=1.
             ggml_tensor * post[2];
-            ggml_tensor * mix[4];
+            ggml_tensor * mix_rows[4];
         };
 
         routing build_route(ggml_tensor * a, ggml_tensor * b, ggml_tensor * weight, ggml_tensor * bias, int il);

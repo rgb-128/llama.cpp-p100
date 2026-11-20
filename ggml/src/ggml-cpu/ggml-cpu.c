@@ -2090,6 +2090,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_solve_tri(params, tensor);
             } break;
+        case GGML_OP_MHC_PRE:
+            {
+                ggml_compute_forward_mhc_pre(params, tensor);
+            } break;
+        case GGML_OP_MHC_MERGE:
+            {
+                ggml_compute_forward_mhc_merge(params, tensor);
+            } break;
+        case GGML_OP_MHC_SINKHORN2:
+            {
+                ggml_compute_forward_mhc_sinkhorn2(params, tensor);
+            } break;
         case GGML_OP_GATED_DELTA_NET:
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
@@ -2290,6 +2302,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGMAX:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_MHC_PRE:
+        case GGML_OP_MHC_MERGE:
+        case GGML_OP_MHC_SINKHORN2:
+            {
+                n_tasks = MIN(n_threads, node->ne[1]);
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:

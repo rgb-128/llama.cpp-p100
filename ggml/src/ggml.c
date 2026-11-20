@@ -1108,9 +1108,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MHC_SINKHORN2",
+    "MHC_PRE",
+    "MHC_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1228,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "mhc_sinkhorn2(x)",
+    "mhc_pre(a,b,logits)",
+    "mhc_merge(a,b,branch,logits,mix)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6472,6 +6480,61 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+// ggml_mhc_sinkhorn2
+
+struct ggml_tensor * ggml_mhc_sinkhorn2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mix,
+        int32_t               n_iter) {
+    GGML_ASSERT(mix->type == GGML_TYPE_F32);
+    GGML_ASSERT(mix->ne[0] == 4 && ggml_is_matrix(mix));
+    GGML_ASSERT(mix->nb[0] == sizeof(float));
+    GGML_ASSERT(n_iter >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, mix->ne[1]);
+    ggml_set_op_params_i32(result, 0, n_iter);
+    result->op     = GGML_OP_MHC_SINKHORN2;
+    result->src[0] = mix;
+
+    return result;
+}
+
+// ggml_mhc_pre / ggml_mhc_merge
+
+struct ggml_tensor * ggml_mhc_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        struct ggml_tensor * logits,
+        float scale) {
+    GGML_ASSERT(ggml_mhc_pre_valid(a, b, logits));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
+    ggml_set_op_params(result, &scale, sizeof(scale));
+    result->op = GGML_OP_MHC_PRE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = logits;
+    return result;
+}
+
+struct ggml_tensor * ggml_mhc_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        struct ggml_tensor * branch,
+        struct ggml_tensor * logits,
+        struct ggml_tensor * mix) {
+    GGML_ASSERT(ggml_mhc_merge_valid(a, b, branch, logits, mix));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], 2);
+    result->op = GGML_OP_MHC_MERGE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = branch;
+    result->src[3] = logits;
+    result->src[4] = mix;
     return result;
 }
 

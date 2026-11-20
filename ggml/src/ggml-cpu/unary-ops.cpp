@@ -335,3 +335,98 @@ void ggml_compute_forward_xielu(const ggml_compute_params * params, ggml_tensor 
     unary_op_functor(params, dst, xielu_op_params);
 }
 
+
+// Keep every scalar operation identical to the unfused SUB/NEG/SOFTPLUS/EXP chain.
+static inline void mhc_normalize_pair(float & x, float & y) {
+    const float d = x - y;
+    x = op_neg(op_softplus(op_neg(d)));
+    y = op_neg(op_softplus(d));
+}
+
+void ggml_compute_forward_mhc_sinkhorn2(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * mix = dst->src[0];
+    GGML_ASSERT(mix->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mix->ne[0] == 4 && ggml_is_matrix(mix) && mix->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(mix, dst) && ggml_is_contiguous(dst));
+
+    const int32_t n_iter = ggml_get_op_params_i32(dst, 0);
+    const auto [r0, r1] = get_thread_range(params, mix);
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * src = (const float *) ((const char *) mix->data + r*mix->nb[1]);
+        float m0 = src[0], m1 = src[1], m2 = src[2], m3 = src[3];
+        for (int32_t i = 0; i < n_iter; ++i) {
+            mhc_normalize_pair(m0, m1);
+            mhc_normalize_pair(m2, m3);
+            mhc_normalize_pair(m0, m2);
+            mhc_normalize_pair(m1, m3);
+        }
+        float * out = (float *) dst->data + 4*r;
+        out[0] = op_exp(m0);
+        out[1] = op_exp(m1);
+        out[2] = op_exp(m2);
+        out[3] = op_exp(m3);
+    }
+}
+// Volatile temporaries force an F32 rounding boundary, even in builds that permit
+// FP contraction. The original graph stores each MUL/ADD in a separate tensor.
+static inline float mhc_mul_rn(float x, float y) {
+    volatile float r = x*y;
+    return r;
+}
+
+static inline float mhc_add_rn(float x, float y) {
+    volatile float r = x + y;
+    return r;
+}
+
+void ggml_compute_forward_mhc_pre(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * logits = dst->src[2];
+    GGML_ASSERT(ggml_mhc_pre_valid(a, b, logits));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_are_same_shape(a, dst));
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const int64_t n = a->ne[0];
+    const auto [r0, r1] = get_thread_range(params, a);
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * l = (const float *) logits->data + r*logits->ne[0];
+        const float s0 = op_sigmoid(l[0]);
+        const float s1 = op_sigmoid(l[1]);
+        const float * x = (const float *) a->data + r*n;
+        const float * y = (const float *) b->data + r*n;
+        float * out = (float *) dst->data + r*n;
+        for (int64_t i = 0; i < n; ++i) {
+            out[i] = mhc_mul_rn(mhc_add_rn(mhc_mul_rn(x[i], s0), mhc_mul_rn(y[i], s1)), scale);
+        }
+    }
+}
+
+void ggml_compute_forward_mhc_merge(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * branch = dst->src[2];
+    const ggml_tensor * logits = dst->src[3];
+    const ggml_tensor * mix = dst->src[4];
+    GGML_ASSERT(ggml_mhc_merge_valid(a, b, branch, logits, mix));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+                dst->ne[0] == a->ne[0] && dst->ne[1] == a->ne[1] && dst->ne[2] == 2 && dst->ne[3] == 1);
+    const int64_t n = a->ne[0];
+    const int64_t slice = n*a->ne[1];
+    const auto [r0, r1] = get_thread_range(params, a);
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * l = (const float *) logits->data + r*logits->ne[0];
+        const float p0 = mhc_mul_rn(op_sigmoid(l[2]), 2.0f);
+        const float p1 = mhc_mul_rn(op_sigmoid(l[3]), 2.0f);
+        const float * m = mix ? (const float *) mix->data + 4*r : nullptr;
+        const float * x = (const float *) a->data + r*n;
+        const float * y = (const float *) b->data + r*n;
+        const float * z = (const float *) branch->data + r*n;
+        float * out = (float *) dst->data + r*n;
+        for (int64_t i = 0; i < n; ++i) {
+            const float na = m ? mhc_add_rn(mhc_mul_rn(x[i], m[0]), mhc_mul_rn(y[i], m[1])) : x[i];
+            const float nb = m ? mhc_add_rn(mhc_mul_rn(x[i], m[2]), mhc_mul_rn(y[i], m[3])) : y[i];
+            out[i]         = mhc_add_rn(na, mhc_mul_rn(z[i], p0));
+            out[i + slice] = mhc_add_rn(nb, mhc_mul_rn(z[i], p1));
+        }
+    }
+}

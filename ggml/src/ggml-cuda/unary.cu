@@ -870,3 +870,119 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// One thread owns all four logits of a row. Use the same scalar functions as
+// the unfused kernels, including both assignments from the original difference.
+static __device__ __forceinline__ void mhc_normalize_pair(float & x, float & y) {
+    const float d = x - y;
+    x = op_neg(op_softplus(op_neg(d)));
+    y = op_neg(op_softplus(d));
+}
+
+static __global__ void mhc_sinkhorn2_f32(const char * mix, float * dst,
+                                       const int64_t n_rows, const size_t row_stride, const int32_t n_iter) {
+    const int64_t r = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+    const float * src = (const float *) (mix + r*row_stride);
+    float m0 = src[0], m1 = src[1], m2 = src[2], m3 = src[3];
+    for (int32_t i = 0; i < n_iter; ++i) {
+        mhc_normalize_pair(m0, m1);
+        mhc_normalize_pair(m2, m3);
+        mhc_normalize_pair(m0, m2);
+        mhc_normalize_pair(m1, m3);
+    }
+    dst[4*r + 0] = op_exp(m0);
+    dst[4*r + 1] = op_exp(m1);
+    dst[4*r + 2] = op_exp(m2);
+    dst[4*r + 3] = op_exp(m3);
+}
+
+void ggml_cuda_op_mhc_sinkhorn2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * mix = dst->src[0];
+    GGML_ASSERT(mix->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mix->ne[0] == 4 && ggml_is_matrix(mix) && mix->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(mix, dst) && ggml_is_contiguous(dst));
+
+    const int64_t n_rows = mix->ne[1];
+    if (n_rows == 0) {
+        return;
+    }
+    const int32_t n_iter = ggml_get_op_params_i32(dst, 0);
+    const int block_size = 128;
+    mhc_sinkhorn2_f32<<<(n_rows + block_size - 1)/block_size, block_size, 0, ctx.stream()>>>(
+        (const char *) mix->data, (float *) dst->data, n_rows, mix->nb[1], n_iter);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static __global__ void mhc_pre_f32(const float * a, const float * b, const float * logits, float * dst,
+                                  const int64_t n, const int64_t n_embd, const int64_t n_logits, const float scale) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float * l = logits + (i/n_embd)*n_logits;
+    const float x = __fmul_rn(a[i], op_sigmoid(l[0]));
+    const float y = __fmul_rn(b[i], op_sigmoid(l[1]));
+    dst[i] = __fmul_rn(__fadd_rn(x, y), scale);
+}
+
+static __global__ void mhc_merge_f32(const float * a, const float * b, const float * branch,
+                                    const float * logits, const float * mix, float * dst,
+                                    const int64_t n, const int64_t n_embd, const int64_t n_logits) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t r = i/n_embd;
+    const float * l = logits + r*n_logits;
+    const float p0 = __fmul_rn(op_sigmoid(l[2]), 2.0f);
+    const float p1 = __fmul_rn(op_sigmoid(l[3]), 2.0f);
+    float na = a[i], nb = b[i];
+    if (mix) {
+        const float * m = mix + 4*r;
+        na = __fadd_rn(__fmul_rn(a[i], m[0]), __fmul_rn(b[i], m[1]));
+        nb = __fadd_rn(__fmul_rn(a[i], m[2]), __fmul_rn(b[i], m[3]));
+    }
+    dst[i]     = __fadd_rn(na, __fmul_rn(branch[i], p0));
+    dst[i + n] = __fadd_rn(nb, __fmul_rn(branch[i], p1));
+}
+
+void ggml_cuda_op_mhc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * logits = dst->src[2];
+    GGML_ASSERT(ggml_mhc_pre_valid(a, b, logits));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_are_same_shape(a, dst));
+    const int64_t n = ggml_nelements(a);
+    if (n == 0) {
+        return;
+    }
+    const int block_size = 256;
+    mhc_pre_f32<<<(n + block_size - 1)/block_size, block_size, 0, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) logits->data, (float *) dst->data,
+        n, a->ne[0], logits->ne[0], ggml_get_op_params_f32(dst, 0));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_op_mhc_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * branch = dst->src[2];
+    const ggml_tensor * logits = dst->src[3];
+    const ggml_tensor * mix = dst->src[4];
+    GGML_ASSERT(ggml_mhc_merge_valid(a, b, branch, logits, mix));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+                dst->ne[0] == a->ne[0] && dst->ne[1] == a->ne[1] && dst->ne[2] == 2 && dst->ne[3] == 1);
+    const int64_t n = ggml_nelements(a);
+    if (n == 0) {
+        return;
+    }
+    const int block_size = 256;
+    mhc_merge_f32<<<(n + block_size - 1)/block_size, block_size, 0, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) branch->data,
+        (const float *) logits->data, mix ? (const float *) mix->data : nullptr, (float *) dst->data,
+        n, a->ne[0], logits->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}

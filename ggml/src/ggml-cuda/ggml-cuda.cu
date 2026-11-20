@@ -2994,6 +2994,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_MHC_PRE:
+            ggml_cuda_op_mhc_pre(ctx, dst);
+            break;
+        case GGML_OP_MHC_MERGE:
+            ggml_cuda_op_mhc_merge(ctx, dst);
+            break;
+        case GGML_OP_MHC_SINKHORN2:
+            ggml_cuda_op_mhc_sinkhorn2(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -7319,6 +7328,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_MHC_PRE:
+            return ggml_mhc_pre_valid(op->src[0], op->src[1], op->src[2]) &&
+                op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_are_same_shape(op, op->src[0]);
+        case GGML_OP_MHC_MERGE:
+            return ggml_mhc_merge_valid(op->src[0], op->src[1], op->src[2], op->src[3], op->src[4]) &&
+                op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[0]->ne[1] &&
+                op->ne[2] == 2 && op->ne[3] == 1;
+        case GGML_OP_MHC_SINKHORN2:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == 4 && ggml_is_matrix(op->src[0]) && op->src[0]->nb[0] == sizeof(float) &&
+                ggml_are_same_shape(op->src[0], op) && ggml_is_contiguous(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

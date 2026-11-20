@@ -602,6 +602,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MHC_SINKHORN2,
+        GGML_OP_MHC_PRE,
+        GGML_OP_MHC_MERGE,
+
         GGML_OP_COUNT,
     };
 
@@ -2695,6 +2699,40 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // Two-stream mHC Sinkhorn normalization in log space, followed by exp.
+    // mix: F32 [4, n_rows], with nb[0] == sizeof(float); result: contiguous F32 [4, n_rows].
+    // Each iteration normalizes pairs (0,1), (2,3), (0,2), (1,3), in that order:
+    // d = x - y; x = -softplus(-d); y = -softplus(d), using the same old d.
+    // n_iter >= 0; zero iterations applies only exp to the input logits.
+    GGML_API struct ggml_tensor * ggml_mhc_sinkhorn2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mix,
+            int32_t               n_iter);
+
+    // Two-stream mHC pre-mix: ((a*sigmoid(l0)) + (b*sigmoid(l1)))*scale.
+    // All inputs must be contiguous F32 matrices. a, b: [n_embd, n_tok];
+    // logits: [8, n_tok] (also [4, n_tok] for fixed-identity routing).
+    // Returns contiguous F32 [n_embd, n_tok], with each multiply/add rounded separately.
+    GGML_API struct ggml_tensor * ggml_mhc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * logits,
+            float                 scale);
+
+    // Two-stream mHC merge. branch has the same shape as a/b; mix is contiguous
+    // F32 [4, n_tok], or NULL for identity mixing (which also accepts 4 logits).
+    // na = a*m0 + b*m1; nb = a*m2 + b*m3 (or na=a, nb=b if mix is NULL).
+    // Returns contiguous F32 [n_embd, n_tok, 2]:
+    // slice 0 = na + branch*(sigmoid(l2)*2); slice 1 = nb + branch*(sigmoid(l3)*2).
+    GGML_API struct ggml_tensor * ggml_mhc_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * branch,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * mix);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

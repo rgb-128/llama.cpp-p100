@@ -28,6 +28,24 @@
 extern "C" {
 #endif
 
+// Shared constructor/backend validation for the contiguous two-stream mHC ops.
+static inline bool ggml_mhc_pre_valid(const struct ggml_tensor * a, const struct ggml_tensor * b,
+                                      const struct ggml_tensor * logits) {
+    return a && b && logits && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+        logits->type == GGML_TYPE_F32 && ggml_is_matrix(a) && ggml_are_same_shape(a, b) &&
+        ggml_is_matrix(logits) && (logits->ne[0] == 8 || logits->ne[0] == 4) && logits->ne[1] == a->ne[1] &&
+        ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(logits);
+}
+
+static inline bool ggml_mhc_merge_valid(const struct ggml_tensor * a, const struct ggml_tensor * b,
+                                        const struct ggml_tensor * branch, const struct ggml_tensor * logits,
+                                        const struct ggml_tensor * mix) {
+    return ggml_mhc_pre_valid(a, b, logits) && branch && branch->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(a, branch) && ggml_is_contiguous(branch) &&
+        (!mix || (logits->ne[0] == 8 && mix->type == GGML_TYPE_F32 && ggml_is_matrix(mix) &&
+                  mix->ne[0] == 4 && mix->ne[1] == a->ne[1] && ggml_is_contiguous(mix)));
+}
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);

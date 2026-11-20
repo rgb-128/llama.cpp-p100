@@ -4745,6 +4745,88 @@ struct test_snake_fuse : public test_case {
 };
 
 
+struct test_mhc_pre : public test_case {
+    const int64_t n_embd, n_tok, n_logits;
+    const float scale;
+
+    test_mhc_pre(int64_t n_embd, int64_t n_tok, float scale, int64_t n_logits = 8)
+        : n_embd(n_embd), n_tok(n_tok), n_logits(n_logits), scale(scale) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_tok, n_logits, scale);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_logits, n_tok);
+        return ggml_mhc_pre(ctx, a, b, logits, scale);
+    }
+};
+
+struct test_mhc_merge : public test_case {
+    const int64_t n_embd, n_tok, n_logits;
+    const bool with_mix;
+
+    test_mhc_merge(int64_t n_embd, int64_t n_tok, bool with_mix, int64_t n_logits = 8)
+        : n_embd(n_embd), n_tok(n_tok), n_logits(n_logits), with_mix(with_mix) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_tok, n_logits, with_mix);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        auto * branch = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_logits, n_tok);
+        auto * mix = with_mix ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_tok) : nullptr;
+        return ggml_mhc_merge(ctx, a, b, branch, logits, mix);
+    }
+};
+
+struct test_mhc_sinkhorn2 : public test_case {
+    const int64_t n_rows;
+    const int32_t n_iter;
+    const bool view;
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * mix = nullptr;
+
+    test_mhc_sinkhorn2(int64_t n_rows, int32_t n_iter, bool view)
+        : n_rows(n_rows), n_iter(n_iter), view(view) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_rows, n_iter, view);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, view ? 8 : 4, n_rows);
+        ggml_set_name(logits, "logits");
+        mix = view ? ggml_view_2d(ctx, logits, 4, n_rows, logits->nb[1], 4*sizeof(float)) : logits;
+        ggml_tensor * out = ggml_mhc_sinkhorn2(ctx, mix, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::mt19937 rng(1234);
+        // Differences up to 160 exercise the softplus >20 branch and exp underflow.
+        std::uniform_real_distribution<float> dist(-80.0f, 80.0f);
+        std::vector<float> data(ggml_nelements(logits));
+        for (float & x : data) {
+            x = dist(rng);
+        }
+        const size_t offset = view ? 4 : 0;
+        data[offset + 0] = -80.0f;
+        data[offset + 1] =  80.0f;
+        data[offset + 2] =  80.0f;
+        data[offset + 3] = -80.0f;
+        ggml_backend_tensor_set(logits, data.data(), 0, data.size()*sizeof(float));
+    }
+};
+
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -10230,6 +10312,26 @@ struct ggml_type_pair { ggml_type a, b; };
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    for (int64_t n_embd : {13, 4096}) {
+        for (int64_t n_tok : {1, 2, 5, 33}) {
+            for (float scale : {0.5f, 1.234567f}) {
+                test_cases.emplace_back(new test_mhc_pre(n_embd, n_tok, scale));
+                test_cases.emplace_back(new test_mhc_pre(n_embd, n_tok, scale, 4));
+            }
+            test_cases.emplace_back(new test_mhc_merge(n_embd, n_tok, true));
+            test_cases.emplace_back(new test_mhc_merge(n_embd, n_tok, false));
+            test_cases.emplace_back(new test_mhc_merge(n_embd, n_tok, false, 4));
+        }
+    }
+
+    for (int64_t n_rows : {1, 7, 32, 257}) {
+        for (int32_t n_iter : {0, 1, 3, 20}) {
+            for (bool view : {false, true}) {
+                test_cases.emplace_back(new test_mhc_sinkhorn2(n_rows, n_iter, view));
+            }
+        }
+    }
 
     // P100 BF16 decode shapes; these also run against the CPU reference on other backends.
     for (int64_t n : {1, 2, 4}) {

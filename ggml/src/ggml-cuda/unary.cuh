@@ -63,6 +63,8 @@ void ggml_cuda_op_log(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_mhc_sinkhorn2(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 bool ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * sp, ggml_tensor * mul);
@@ -138,3 +140,6 @@ __device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float g
             return up * gate;
     }
 }
+
+void ggml_cuda_op_mhc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_mhc_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

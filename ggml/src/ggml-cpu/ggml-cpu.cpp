@@ -469,6 +469,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
             return max_bias == 0.0f;
         }
+        case GGML_OP_MHC_PRE:
+            return ggml_mhc_pre_valid(op->src[0], op->src[1], op->src[2]) &&
+                op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_are_same_shape(op, op->src[0]);
+        case GGML_OP_MHC_MERGE:
+            return ggml_mhc_merge_valid(op->src[0], op->src[1], op->src[2], op->src[3], op->src[4]) &&
+                op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[0]->ne[1] &&
+                op->ne[2] == 2 && op->ne[3] == 1;
+        case GGML_OP_MHC_SINKHORN2:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                src0->ne[0] == 4 && ggml_is_matrix(src0) && src0->nb[0] == sizeof(float) &&
+                ggml_are_same_shape(src0, op) && ggml_is_contiguous(op);
         case GGML_OP_IM2COL_BACK:
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:

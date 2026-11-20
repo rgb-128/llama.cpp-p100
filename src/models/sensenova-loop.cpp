@@ -1,6 +1,8 @@
 #include "models.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
@@ -117,13 +119,24 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
     };
 
     routing result{};
+    result.logits = logits;
+    const char * unfused = std::getenv("LOOP_MHC_UNFUSED");
+    if (!(unfused && std::strcmp(unfused, "1") == 0)) {
+        result.input = ggml_mhc_pre(ctx0, a, b, logits, hparams.mhc_pre_scale);
+        if (!hparams.mhc_fixed_identity) {
+            ggml_tensor * mix = ggml_view_2d(ctx0, logits, 4, a->ne[1], logits->nb[1], 4*logits->nb[0]);
+            result.mix = ggml_mhc_sinkhorn2(ctx0, mix, hparams.mhc_iterations);
+        }
+        cb(result.input, "mhc_input", il);
+        return result;
+    }
     result.input = ggml_add(ctx0, ggml_mul(ctx0, a, ggml_sigmoid(ctx0, row(0))), ggml_mul(ctx0, b, ggml_sigmoid(ctx0, row(1))));
     result.input = ggml_scale(ctx0, result.input, hparams.mhc_pre_scale);
     result.post[0] = ggml_scale(ctx0, ggml_sigmoid(ctx0, row(2)), 2.0f);
     result.post[1] = ggml_scale(ctx0, ggml_sigmoid(ctx0, row(3)), 2.0f);
     if (!hparams.mhc_fixed_identity) {
         for (int i = 0; i < 4; ++i) {
-            result.mix[i] = row(4 + i);
+            result.mix_rows[i] = row(4 + i);
         }
         auto normalize = [&](ggml_tensor * & x, ggml_tensor * & y) {
             // Two-element log-softmax, without exponentiating the unnormalized logits.
@@ -132,12 +145,12 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
             y = ggml_neg(ctx0, ggml_softplus(ctx0, delta));
         };
         for (uint32_t i = 0; i < hparams.mhc_iterations; ++i) {
-            normalize(result.mix[0], result.mix[1]);
-            normalize(result.mix[2], result.mix[3]);
-            normalize(result.mix[0], result.mix[2]);
-            normalize(result.mix[1], result.mix[3]);
+            normalize(result.mix_rows[0], result.mix_rows[1]);
+            normalize(result.mix_rows[2], result.mix_rows[3]);
+            normalize(result.mix_rows[0], result.mix_rows[2]);
+            normalize(result.mix_rows[1], result.mix_rows[3]);
         }
-        for (auto & mix : result.mix) {
+        for (auto & mix : result.mix_rows) {
             mix = ggml_exp(ctx0, mix);
         }
     }
@@ -147,11 +160,18 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
 
 void llama_model_sensenova_loop::graph::build_merge(
         ggml_tensor * & a, ggml_tensor * & b, ggml_tensor * branch, const routing & route) {
+    const char * unfused = std::getenv("LOOP_MHC_UNFUSED");
+    if (!(unfused && std::strcmp(unfused, "1") == 0)) {
+        ggml_tensor * merged = ggml_mhc_merge(ctx0, a, b, branch, route.logits, route.mix);
+        a = ggml_view_2d(ctx0, merged, merged->ne[0], merged->ne[1], merged->nb[1], 0);
+        b = ggml_view_2d(ctx0, merged, merged->ne[0], merged->ne[1], merged->nb[1], merged->nb[2]);
+        return;
+    }
     ggml_tensor * next_a = a;
     ggml_tensor * next_b = b;
     if (!hparams.mhc_fixed_identity) {
-        next_a = ggml_add(ctx0, ggml_mul(ctx0, a, route.mix[0]), ggml_mul(ctx0, b, route.mix[1]));
-        next_b = ggml_add(ctx0, ggml_mul(ctx0, a, route.mix[2]), ggml_mul(ctx0, b, route.mix[3]));
+        next_a = ggml_add(ctx0, ggml_mul(ctx0, a, route.mix_rows[0]), ggml_mul(ctx0, b, route.mix_rows[1]));
+        next_b = ggml_add(ctx0, ggml_mul(ctx0, a, route.mix_rows[2]), ggml_mul(ctx0, b, route.mix_rows[3]));
     }
     a = ggml_add(ctx0, next_a, ggml_mul(ctx0, branch, route.post[0]));
     b = ggml_add(ctx0, next_b, ggml_mul(ctx0, branch, route.post[1]));
@@ -195,9 +215,17 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
             if (mhc) {
                 a = ggml_get_rows(ctx0, a, inp_out_ids);
                 b = ggml_get_rows(ctx0, b, inp_out_ids);
-                for (auto & post : attn_route.post) { post = ggml_get_rows(ctx0, post, inp_out_ids); }
-                if (!hparams.mhc_fixed_identity) {
-                    for (auto & mix : attn_route.mix) { mix = ggml_get_rows(ctx0, mix, inp_out_ids); }
+                const char * unfused = std::getenv("LOOP_MHC_UNFUSED");
+                if (unfused && std::strcmp(unfused, "1") == 0) {
+                    for (auto & post : attn_route.post) { post = ggml_get_rows(ctx0, post, inp_out_ids); }
+                    if (!hparams.mhc_fixed_identity) {
+                        for (auto & mix : attn_route.mix_rows) { mix = ggml_get_rows(ctx0, mix, inp_out_ids); }
+                    }
+                } else {
+                    attn_route.logits = ggml_get_rows(ctx0, attn_route.logits, inp_out_ids);
+                    if (attn_route.mix) {
+                        attn_route.mix = ggml_get_rows(ctx0, attn_route.mix, inp_out_ids);
+                    }
                 }
             }
         }
