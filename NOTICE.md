@@ -15,3 +15,5 @@ It carries, as patches, code from:
   hybrid implementations this fork builds on.
 
 The MIT permission notice in LICENSE applies to all of the above code.
+
+- SenseTime (SenseNova): the SenseNova-Loop-9B architecture, mHC and MTP code, ported from the reference implementation (blueswhen/llama.cpp, branch `sensenova-loop`, commits 40de778 and 24ea7bb), MIT. The fused mHC ops (`ggml_mhc_sinkhorn2`, `ggml_mhc_pre`, `ggml_mhc_merge`) are ours.

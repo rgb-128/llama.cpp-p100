@@ -17,6 +17,17 @@ plus our fixes:
 
 The speed comes from Kmic-68 and co's kernels. Patch series and notes: [docs/P100.md](docs/P100.md).
 
+
+## New: SenseNova-Loop-9B at 34 tok/s on one P100 (branch `loop9b`)
+SenseTime's SenseNova-Loop-9B (text + vision) did not run in upstream llama.cpp yet. Branch `loop9b` ports it
+and fuses its mHC mixing steps into three GPU ops: 6.9 tok/s on SenseTime's own build vs 34.0 tok/s here,
+same prompt, one Tesla P100. Full recipe: [README-LOOP9B.md](README-LOOP9B.md). Server line:
+```
+CUDA_VISIBLE_DEVICES=0 GGML_CUDA_GRAPHS_PRE_VOLTA=3 ./build/bin/llama-server \
+  -m SenseNova-Loop-9B-Q4_K_M.gguf --mmproj mmproj-SenseNova-Loop-9B-F16.gguf --image-min-tokens 1024 \
+  -ngl 99 -fa on -c 98304 -ctk q8_0 -ctv q8_0 -np 1 --jinja --port 8080
+```
+
 ## Speed: it ties Kmic's fork, it does not beat it
 
 Measured by us on one box, 2026-10-27: 2x Tesla P100 16 GB (PCIe), tensor split (`-sm tensor`),
