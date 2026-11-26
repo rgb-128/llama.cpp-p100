@@ -43,13 +43,22 @@ constexpr int BM  = 128;
 constexpr int BN  = 128;
 constexpr int BK2 = 16;     // k2 steps per smem tile = 32 values of K
 
+template <int GLU_MODE = 0>
 __global__ void gemm_fold_prescale(const float * __restrict__ X, const int64_t s1, half * __restrict__ X16,
-                                   float * __restrict__ cs, const int K, const int xexp) {
+                                   float * __restrict__ cs, const int K, const int xexp,
+                                   const float * __restrict__ U = nullptr, const int64_t su = 0) {
     const int n = blockIdx.x;
     const float * x = X + n*s1;
+    const float * u = U ? (U + n*su) : nullptr;
     float m = 0.0f;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        m = fmaxf(m, fabsf(x[k]));
+        float v = x[k];
+        if constexpr (GLU_MODE == 1) {
+            v = ggml_cuda_op_silu_single(v) * u[k];
+        } else if constexpr (GLU_MODE == 2) {
+            v = ggml_cuda_op_gelu_single(v) * u[k];
+        }
+        m = fmaxf(m, fabsf(v));
     }
     __shared__ float sm[32];
     m = warp_reduce_max(m);
@@ -70,7 +79,13 @@ __global__ void gemm_fold_prescale(const float * __restrict__ X, const int64_t s
     const float s = ldexpf(1.0f, -e);
     half * y = X16 + (int64_t) n*K;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        y[k] = __float2half(x[k]*s);
+        float v = x[k];
+        if constexpr (GLU_MODE == 1) {
+            v = ggml_cuda_op_silu_single(v) * u[k];
+        } else if constexpr (GLU_MODE == 2) {
+            v = ggml_cuda_op_gelu_single(v) * u[k];
+        }
+        y[k] = __float2half(v*s);
     }
     if (threadIdx.x == 0) {
         cs[n] = ldexpf(1.0f, e) * 0x1p112f;
@@ -86,8 +101,13 @@ static __device__ __forceinline__ float4 gemm_fold_swiglu4(const float4 g, const
                        ggml_cuda_op_silu_single(g.z) * u.z, ggml_cuda_op_silu_single(g.w) * u.w);
 }
 
-template <int NV, bool GLU = false>
-__global__ void __launch_bounds__(256) gemm_fold_prescale_v(const float * __restrict__ X, const int64_t s1,
+static __device__ __forceinline__ float4 gemm_fold_geglu4(const float4 g, const float4 u) {
+    return make_float4(ggml_cuda_op_gelu_single(g.x) * u.x, ggml_cuda_op_gelu_single(g.y) * u.y,
+                       ggml_cuda_op_gelu_single(g.z) * u.z, ggml_cuda_op_gelu_single(g.w) * u.w);
+}
+
+template <int NV, int GLU_MODE = 0>
+__global__ void __launch_bounds__(256, 3) gemm_fold_prescale_v(const float * __restrict__ X, const int64_t s1,
         half * __restrict__ X16, float * __restrict__ cs, const int K, const int xexp,
         const float * __restrict__ U = nullptr, const int64_t su = 0) {
     const int n = blockIdx.x;
@@ -100,8 +120,14 @@ __global__ void __launch_bounds__(256) gemm_fold_prescale_v(const float * __rest
     for (int i = 0; i < NV; i++) {
         const int k = threadIdx.x + 256*i;
         r[i] = k < K4 ? x[k] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (GLU && k < K4) {
-            r[i] = gemm_fold_swiglu4(r[i], u[k]);
+        if constexpr (GLU_MODE == 1) {
+            if (k < K4) {
+                r[i] = gemm_fold_swiglu4(r[i], u[k]);
+            }
+        } else if constexpr (GLU_MODE == 2) {
+            if (k < K4) {
+                r[i] = gemm_fold_geglu4(r[i], u[k]);
+            }
         }
         m = fmaxf(m, fmaxf(fmaxf(fabsf(r[i].x), fabsf(r[i].y)), fmaxf(fabsf(r[i].z), fabsf(r[i].w))));
     }
@@ -803,11 +829,10 @@ static bool gemm_fold_glu_input_ok(const ggml_tensor * t) {
 
 bool ggml_cuda_gemm_fold_glu_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm) {
     static const bool on = ggml_cuda_gemm_fold_env("GGML_CUDA_FOLD_GLU", 1) != 0;
-    static const bool pv = ggml_cuda_gemm_fold_env("GGML_CUDA_FOLD_PRESCALE_V", 1) != 0;
     const ggml_tensor * src0 = mm->src[0];
     const int64_t K = src0->ne[0];
-    return on && pv && mm->src[1] == glu && gemm_fold_shape_ok(ctx, src0, glu, mm) &&
-           K % 4 == 0 && K <= 1024*9 && glu->src[0]->ne[0] == K && glu->src[1]->ne[0] == K &&
+    return on && mm->src[1] == glu && gemm_fold_shape_ok(ctx, src0, glu, mm) &&
+           K % 4 == 0 && glu->src[0]->ne[0] == K && glu->src[1]->ne[0] == K &&
            glu->src[0]->ne[1] == glu->ne[1] && glu->src[1]->ne[1] == glu->ne[1] &&
            gemm_fold_glu_input_ok(glu->src[0]) && gemm_fold_glu_input_ok(glu->src[1]);
 }
@@ -853,7 +878,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const int64_t s1 = src1->nb[1]/sizeof(float);
         const bool vec = pv && K % 4 == 0 && s1 % 4 == 0 && ((uintptr_t) xs) % 16 == 0;
         if (gemm_fold_glu != nullptr && src1 == gemm_fold_glu) {
-            // skipped SwiGLU: gate and up straight from their tensors (checked by ggml_cuda_gemm_fold_glu_ok)
+            // skipped SwiGLU/GeGLU: gate and up straight from their tensors (checked by ggml_cuda_gemm_fold_glu_ok)
             const ggml_tensor * g = src1->src[0];
             const ggml_tensor * u = src1->src[1];
             const float * gd = (const float *) g->data;
@@ -861,12 +886,31 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             const int64_t sg = g->nb[1]/sizeof(float);
             const int64_t su = u->nb[1]/sizeof(float);
             const int     xe = ggml_cuda_gemm_fold_xexp();
-            if (K <= 1024*4) {
-                gemm_fold_prescale_v<4, true><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
-            } else if (K <= 1024*6) {
-                gemm_fold_prescale_v<6, true><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+            const bool    is_geglu = ggml_get_glu_op(src1) == GGML_GLU_OP_GEGLU;
+            if (is_geglu) {
+                if (pv && K <= 1024*4) {
+                    gemm_fold_prescale_v<4, 2><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else if (pv && K <= 1024*6) {
+                    gemm_fold_prescale_v<6, 2><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else if (pv && K <= 1024*9) {
+                    gemm_fold_prescale_v<9, 2><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else if (pv && K <= 1024*11) {
+                    gemm_fold_prescale_v<11, 2><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else {
+                    gemm_fold_prescale<2><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                }
             } else {
-                gemm_fold_prescale_v<9, true><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                if (pv && K <= 1024*4) {
+                    gemm_fold_prescale_v<4, 1><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else if (pv && K <= 1024*6) {
+                    gemm_fold_prescale_v<6, 1><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else if (pv && K <= 1024*9) {
+                    gemm_fold_prescale_v<9, 1><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else if (pv && K <= 1024*11) {
+                    gemm_fold_prescale_v<11, 1><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                } else {
+                    gemm_fold_prescale<1><<<N, 256, 0, stream>>>(gd, sg, x_alloc.get(), s_alloc.get(), K, xe, ud, su);
+                }
             }
             gemm_fold_glu = nullptr;
         } else if (vec && K <= 1024*4) {
@@ -875,6 +919,8 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             gemm_fold_prescale_v<6><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
         } else if (vec && K <= 1024*9) {
             gemm_fold_prescale_v<9><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        } else if (vec && K <= 1024*11) {
+            gemm_fold_prescale_v<11><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
         } else {
             gemm_fold_prescale<<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
         }
@@ -981,7 +1027,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return true;
     }
 
-    if (ctx.xchg_want && xchg_chunks > 1 && N >= 512 && o16 && ggml_cuda_gemm_fold_k2() == 128 &&
+    if (ctx.xchg_want && peer != nullptr && xchg_chunks > 1 && N >= 512 && o16 && ggml_cuda_gemm_fold_k2() == 128 &&
             capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
         // The exchange's f16 narrowing kernels run on the copy stream. At default priority they wait
         // behind compute-stream work (the next GEMM chunk, prefetch dequants) for free SMs; high

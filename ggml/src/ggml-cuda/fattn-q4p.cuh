@@ -225,14 +225,15 @@ static __device__ __forceinline__ int fattn_q4p_pv_dim(const int dg, const int j
 template <int ncols1, int ncols2, bool OLD, bool KQ8 = false>
 __launch_bounds__(256, (fattn_q4p_cfg<ncols1*ncols2, OLD, KQ8>::MINB))
 static __global__ void flash_attn_ext_q4p(
-        const char * __restrict__ Q,
-        const char * __restrict__ K,
-        const char * __restrict__ V,
-        const char * __restrict__ mask,
-        const char * __restrict__ sinks,
-        const int  * __restrict__ KV_max,
-        float      * __restrict__ dst,
-        float2     * __restrict__ dst_meta,
+        const float2 * __restrict__ Q_f2,
+        const char   * __restrict__ K,
+        const char   * __restrict__ V,
+        const half   * __restrict__ mask_h,
+        const float  * __restrict__ sinks,
+        const int    * __restrict__ KV_max,
+        const int    * __restrict__ KV_rows,
+        float        * __restrict__ dst,
+        float2       * __restrict__ dst_meta,
         const float scale,
         const float max_bias,
         const float m0,
@@ -240,14 +241,22 @@ static __global__ void flash_attn_ext_q4p(
         const uint32_t n_head_log2,
         const float logit_softcap,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
-                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+                            const int32_t s01,  const int32_t s02,  const int32_t s03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t s31,  const int64_t s32,  const int64_t s33) {
     ggml_cuda_pdl_lc();
 #if defined(FLASH_ATTN_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const char * Q    = (const char *) Q_f2;
+    const char * mask = (const char *) mask_h;
+    const int32_t nb01 = s01 * (int32_t) sizeof(float2);
+    const int32_t nb02 = s02 * (int32_t) sizeof(float2);
+    const int32_t nb03 = s03 * (int32_t) sizeof(float2);
+    const int32_t nb31 = s31 * (int32_t) sizeof(half);
+    const int64_t nb32 = s32 * (int64_t) sizeof(half);
+    const int64_t nb33 = s33 * (int64_t) sizeof(half);
     constexpr int D = FATTN_Q4P_D;
     constexpr int R = ncols1*ncols2;
     using cfg = fattn_q4p_cfg<R, OLD, KQ8>;
@@ -1178,12 +1187,12 @@ static __global__ void flash_attn_ext_q4p(
                 make_float2(m_s[tid]*LN2, lsum);
         }
     }
-    GGML_UNUSED_VARS(sinks, KV_max, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne12, ne13,
+    GGML_UNUSED_VARS(sinks, KV_max, KV_rows, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne12, ne13,
         ne31, ne32, nb32);
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2,
-        logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
-        nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33);
+    GGML_UNUSED_VARS(Q_f2, K, V, mask_h, sinks, KV_max, KV_rows, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2,
+        logit_softcap, ne00, ne01, ne02, ne03, s01, s02, s03, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
+        nb21, nb22, nb23, ne31, ne32, ne33, s31, s32, s33);
     NO_DEVICE_CODE;
 #endif
 }
@@ -1198,11 +1207,12 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     if (!enabled) {
         return false;
     }
-    const ggml_tensor * Q     = dst->src[0];
-    const ggml_tensor * K     = dst->src[1];
-    const ggml_tensor * V     = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * Q       = dst->src[0];
+    const ggml_tensor * K       = dst->src[1];
+    const ggml_tensor * V       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * kv_rows = dst->src[5];
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc)) {
@@ -1211,7 +1221,7 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     // GGML_CUDA_FA_Q4P_Q8K=0: q8_0 K (with q4_0 V) back to the generic kernels
     static const bool q8k = [] { const char * s = getenv("GGML_CUDA_FA_Q4P_Q8K"); return !s || atoi(s) != 0; }();
     const bool k_ok = K->type == GGML_TYPE_Q4_0 || (q8k && K->type == GGML_TYPE_Q8_0);
-    if (!k_ok || V->type != GGML_TYPE_Q4_0 || Q->type != GGML_TYPE_F32 || sinks) {
+    if (!k_ok || V->type != GGML_TYPE_Q4_0 || Q->type != GGML_TYPE_F32 || sinks || kv_rows) {
         return false;
     }
     if (Q->ne[0] != FATTN_Q4P_D || K->ne[0] != FATTN_Q4P_D || V->ne[0] != FATTN_Q4P_D) {
@@ -1244,15 +1254,15 @@ static bool q4p_old() {
 template <int ncols1, int ncols2 = 6>
 static void ggml_cuda_flash_attn_ext_q4p_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (dst->src[1]->type == GGML_TYPE_Q8_0) {
-        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, true>, 256/WARP_SIZE, 0,
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2, char, char>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, true>, 256/WARP_SIZE, 0,
             fattn_q4p_cfg<ncols1*ncols2, false, true>::C, false, false, false, false);
         return;
     }
     if (q4p_old()) {
-        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, true>, 256/WARP_SIZE, 0,
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2, char, char>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, true>, 256/WARP_SIZE, 0,
             fattn_q4p_cfg<ncols1*ncols2, true>::C, false, false, false, false);
     } else {
-        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false>, 256/WARP_SIZE, 0,
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2, char, char>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false>, 256/WARP_SIZE, 0,
             fattn_q4p_cfg<ncols1*ncols2, false>::C, false, false, false, false);
     }
 }

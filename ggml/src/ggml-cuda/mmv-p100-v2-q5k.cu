@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <tuple>
 

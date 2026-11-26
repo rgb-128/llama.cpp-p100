@@ -86,7 +86,11 @@ bool ggml_cuda_gdn_alt(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_alt_
     }
     const bool keep = a.K > 1;
     const int64_t L = keep ? a.n_tokens - (a.K - 1) : a.n_tokens;
-    if (mode == 0 || L < GCH) {
+    const bool aligned =
+        (((uintptr_t) a.q | (uintptr_t) a.k | (uintptr_t) a.v |
+          (uintptr_t) a.curr_state | (uintptr_t) a.dst | (uintptr_t) a.state) & 15) == 0 &&
+        ((a.sq1 | a.sq2 | a.sq3 | a.sv1 | a.sv2 | a.sv3 | a.state_slot_stride | a.s_row) & 3) == 0;
+    if (mode == 0 || L < GCH || !aligned) {
         return false;
     }
     const size_t n = gdn_f32::gdn_ch_scratch_floats(a.H, a.neqk1, a.n_seqs, L);

@@ -2827,6 +2827,99 @@ static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1
 static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int64_t ncols, int64_t K,
                              __half ** xs_ptr, float ** sc_ptr);
 
+// Split-K fused Q8_0 GDN alpha/beta gate kernel for Pascal (handles n=1..12, including single-token decode!).
+// One block (4 warps = 128 threads) per output row across [alpha rows, beta rows]; each lane processes
+// whole 32-element Q8_0 blocks directly against L2-resident F32 activations, then applies the exact
+// softplus(alpha + b) * m and sigmoid(beta) epilogues in one launch (replaces 6-7 launches per GDN layer).
+template <int NC>
+static __global__ __launch_bounds__(128, 4) void mmvq_f16_q8_0_gdn_gate(
+        const uint8_t * __restrict__ W_a,
+        const uint8_t * __restrict__ W_b,
+        const int64_t                row_bytes,
+        const float * __restrict__   X,
+        const int64_t                sx,
+        float * __restrict__         Y_a,
+        float * __restrict__         Y_b,
+        const float * __restrict__   b_vec,
+        const float * __restrict__   m_vec,
+        const int                    rows_a,
+        const int                    K) {
+    const int row_global = blockIdx.x;
+    const bool is_beta   = row_global >= rows_a;
+    const int r          = is_beta ? (row_global - rows_a) : row_global;
+    const uint8_t * row  = (is_beta ? W_b : W_a) + (int64_t) r * row_bytes;
+    const int tid        = threadIdx.x; // 0..127
+    const int lane       = tid & 31;
+    const int wid        = tid >> 5;
+    const int n_blocks   = K >> 5; // K / 32
+
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+
+    for (int blk = tid; blk < n_blocks; blk += 128) {
+        const block_q8_0 * bq = reinterpret_cast<const block_q8_0 *>(row + (int64_t) blk * sizeof(block_q8_0));
+        const float d = __half2float(bq->d);
+        const uint16_t * qs16 = reinterpret_cast<const uint16_t *>(bq->qs);
+
+        float sum[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            sum[c] = 0.0f;
+        }
+
+        // Stream 4 int8 weights at a time (2x 16-bit loads) across all NC columns
+        // so register usage stays low (~40 regs, STACK:0 for all NC=1..12).
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t w0 = qs16[2 * k + 0];
+            const uint32_t w1 = qs16[2 * k + 1];
+            const float q0 = static_cast<float>(static_cast<int8_t>(w0 & 0xFFu));
+            const float q1 = static_cast<float>(static_cast<int8_t>(w0 >> 8));
+            const float q2 = static_cast<float>(static_cast<int8_t>(w1 & 0xFFu));
+            const float q3 = static_cast<float>(static_cast<int8_t>(w1 >> 8));
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const float4 xv = __ldg(reinterpret_cast<const float4 *>(X + (int64_t) c * sx + (int64_t) blk * 32) + k);
+                sum[c] = fmaf(q0, xv.x, sum[c]);
+                sum[c] = fmaf(q1, xv.y, sum[c]);
+                sum[c] = fmaf(q2, xv.z, sum[c]);
+                sum[c] = fmaf(q3, xv.w, sum[c]);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            acc[c] = fmaf(d, sum[c], acc[c]);
+        }
+    }
+
+    __shared__ float red[4][NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float v = acc[c];
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+        }
+        if (lane == 0) {
+            red[wid][c] = v;
+        }
+    }
+    __syncthreads();
+
+    if (wid == 0 && lane < NC) {
+        const int c = lane;
+        float v = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        if (is_beta) {
+            Y_b[(int64_t) c * rows_a + r] = 1.0f / (1.0f + expf(-v));
+        } else {
+            Y_a[(int64_t) c * rows_a + r] = mmvq_f16_softplus(v + b_vec[r]) * m_vec[r];
+        }
+    }
+}
+
 bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
                                  const ggml_tensor * b, const ggml_tensor * m, ggml_tensor * gate_out, ggml_tensor * beta_out,
                                  const int64_t ncols) {
@@ -2843,10 +2936,51 @@ bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_ten
     auto out_ok = [&](const ggml_tensor * t, int64_t r) {
         return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == r*mm_a->ne[1];
     };
-    if (!enabled || mm_a->src[0]->type != GGML_TYPE_Q6_K || mm_b->src[0]->type != GGML_TYPE_Q6_K ||
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) ||
             mm_b->src[1] != src1 || mm_b->src[0]->ne[0] != K || ra + rb >= 256 || ra != rb ||
-            !mmvq_f16_shape_ok(mm_a->src[0], src1, mm_a, ncols) || !mmvq_f16_shape_ok(mm_b->src[0], src1, mm_b, ncols) ||
             !vec_ok(b) || !vec_ok(m) || !out_ok(gate_out, ra) || !out_ok(beta_out, rb)) {
+        return false;
+    }
+    if (mm_a->src[0]->type == GGML_TYPE_Q8_0 && mm_b->src[0]->type == GGML_TYPE_Q8_0) {
+        if (src1->type != GGML_TYPE_F32 || ncols < 1 || ncols > MMVQ_F16_MAX_COLS ||
+                (K % 32) != 0 || mm_a->src[0]->ne[2] != 1 || mm_a->src[0]->ne[3] != 1 ||
+                mm_b->src[0]->ne[2] != 1 || mm_b->src[0]->ne[3] != 1 ||
+                src1->ne[2] != 1 || src1->ne[3] != 1 ||
+                mm_a->src[0]->nb[1] != ggml_row_size(GGML_TYPE_Q8_0, K) ||
+                mm_b->src[0]->nb[1] != mm_a->src[0]->nb[1] ||
+                src1->nb[0] != sizeof(float) || (src1->nb[1] % 16) != 0 ||
+                ((uintptr_t) src1->data % 16) != 0) {
+            return false;
+        }
+        cudaStream_t stream = ctx.stream();
+        const uint8_t * Wa = (const uint8_t *) mm_a->src[0]->data;
+        const uint8_t * Wb = (const uint8_t *) mm_b->src[0]->data;
+        const int64_t rbytes = mm_a->src[0]->nb[1];
+        const float * X = (const float *) src1->data;
+        const int64_t sx = src1->nb[1] / sizeof(float);
+        float * Ya = (float *) gate_out->data;
+        float * Yb = (float *) beta_out->data;
+        const float * bv = (const float *) b->data;
+        const float * mv = (const float *) m->data;
+        const int g_blocks = (int) (ra + rb);
+        mmvq_f16_columns(ncols, [&](const int64_t c0, const int64_t n) {
+            auto go = [&](auto ncc) {
+                constexpr int NC = decltype(ncc)::value;
+                mmvq_f16_q8_0_gdn_gate<NC><<<g_blocks, 128, 0, stream>>>(
+                    Wa, Wb, rbytes, X + c0 * sx, sx, Ya + c0 * ra, Yb + c0 * rb, bv, mv, (int) ra, (int) K);
+            };
+            if (n == 1) { go(std::integral_constant<int, 1>{}); } else { mmvq_f16_nc(n, go); }
+        });
+        CUDA_CHECK(cudaGetLastError());
+        if (ncols < mm_a->ne[1]) {
+            CUDA_CHECK(cudaMemsetAsync(Ya + ncols * ra, 0, (size_t) (mm_a->ne[1] - ncols) * ra * sizeof(float), stream));
+            CUDA_CHECK(cudaMemsetAsync(Yb + ncols * rb, 0, (size_t) (mm_b->ne[1] - ncols) * rb * sizeof(float), stream));
+        }
+        return true;
+    }
+    if (mm_a->src[0]->type != GGML_TYPE_Q6_K || mm_b->src[0]->type != GGML_TYPE_Q6_K ||
+            !mmvq_f16_shape_ok(mm_a->src[0], src1, mm_a, ncols) || !mmvq_f16_shape_ok(mm_b->src[0], src1, mm_b, ncols)) {
         return false;
     }
     __half * xs_ptr;

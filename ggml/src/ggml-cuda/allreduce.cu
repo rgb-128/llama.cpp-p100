@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -66,6 +67,77 @@ static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
     return *(const volatile int *)p;
 }
 
+static __device__ __forceinline__ void ggml_cuda_ar_signal_set_u32(uint32_t * p, uint32_t token) {
+    *(volatile uint32_t *)p = token;
+}
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_signal_get_u32(const uint32_t * p) {
+    return *(const volatile uint32_t *)p;
+}
+
+static __device__ __forceinline__ float4 ggml_cuda_ar_ld_cv_f4(const float4 * p) {
+    float4 r;
+    asm volatile("ld.global.cv.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w) : "l"(p));
+    return r;
+}
+
+static __device__ __forceinline__ uint4 ggml_cuda_ar_ld_cv_u4(const uint4 * p) {
+    uint4 r;
+    asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+}
+
+template <int N, typename T>
+struct ggml_cuda_ar_ptr_pack {
+    T * ptr[N];
+};
+
+template <int N>
+static __device__ __forceinline__ void ggml_cuda_ar_pascal_barrier(
+        uint32_t *                                my_arr,
+        const ggml_cuda_ar_ptr_pack<N, uint32_t> & arr_ptrs,
+        int                                       tid,
+        int                                       off,
+        int                                       my_rank,
+        uint32_t                                  token) {
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set_u32(my_arr + off, token);
+        __threadfence_system();
+    }
+    if (tid < N && tid != my_rank) {
+        const uint32_t * peer_arr;
+        if constexpr (N == 2) {
+            peer_arr = (tid == 0) ? arr_ptrs.ptr[0] : arr_ptrs.ptr[1];
+        } else {
+            peer_arr = (tid == 0) ? arr_ptrs.ptr[0]
+                     : (tid == 1) ? arr_ptrs.ptr[1]
+                     : (tid == 2) ? arr_ptrs.ptr[2]
+                                  : arr_ptrs.ptr[3];
+        }
+        peer_arr += off;
+        while (ggml_cuda_ar_signal_get_u32(peer_arr) != token) {
+            // Pascal has no __nanosleep; parallel per-peer volatile poll on mapped DDIO line.
+        }
+    }
+}
+
+// Fast exact round-to-nearest-even F32 <-> BF16 bit helpers for Pascal (sm_60),
+// which has no hardware BF16 instructions.  Zero overflow risk (full FP32 exponent
+// range up to 3.4e38) and ~3 ALU ops/elem completely hidden behind PCIe/QPI BW.
+static __device__ __forceinline__ uint16_t ggml_cuda_ar_f32_to_bf16_bits(float x) {
+    uint32_t u = __float_as_uint(x);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return static_cast<uint16_t>((u >> 16) | 0x0040u);
+    }
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return static_cast<uint16_t>(u >> 16);
+}
+
+static __device__ __forceinline__ float ggml_cuda_ar_bf16_bits_to_f32(uint16_t h) {
+    return __uint_as_float(static_cast<uint32_t>(h) << 16);
+}
+
 // Byte spacing between adjacent arrival ints.  64 bytes (one cache line)
 // ensures each GPU/block's arrival slot lives on its own line, preventing
 // false-sharing stalls on the polling GPU.
@@ -75,6 +147,551 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // disjoint slice of the data and synchronizes through its own arrival-token
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
+
+// Pascal multi-GPU (2x / 4x) fast-path constants:
+//  * 4-slot ring: every AR kernel is a full cross-GPU barrier on the compute
+//    stream, so by call k+2 every GPU has guaranteed exited call k.  4 slots
+//    give 2 full extra barriers of margin -> ZERO CPU cudaEventSynchronize!
+//  * Up to 16 blocks for hierarchical BAR-P2P prefill transfers (still only
+//    16/56 SMs on GP100 -> 100% guaranteed simultaneous residency).
+//  * 4 phases per (slot, rank, block) in the arrival ring so intra-socket and
+//    cross-socket barriers live on disjoint cache lines.
+static constexpr int    GGML_CUDA_AR_PASCAL_POOL_SIZE    = 4;
+static constexpr int    GGML_CUDA_AR_PASCAL_MAX_BLOCKS   = 16;
+static constexpr int    GGML_CUDA_AR_PASCAL_PHASES       = 4;
+static constexpr size_t GGML_CUDA_AR_PASCAL_HIER_SLICE   = 4 * 1024 * 1024; // 4 MB BF16 half-buffer -> 16 MB F32 chunk!
+
+// ---------------------------------------------------------------------------
+// Pascal N-GPU (N=2 or N=4) Single-Kernel Zero-Sync DDIO AllReduce (F32 wire).
+//
+// Latency-optimal path for small/medium decode and speculative-verify tensors.
+//  * Zero CUDA events, zero CPU cudaEventSynchronize, zero cudaMemsetAsync.
+//  * Single cross-GPU barrier per call (out-of-place mapped pinned staging).
+//  * When count_vec <= gridDim.x * blockDim.x (e.g. <= 32 KB at 8 blocks),
+//    keeps own float4 in registers across the barrier (no HBM2 re-read!).
+//  * Deterministic rank-order sum 0 + 1 + ... + (N-1) guarantees 100% bit-
+//    identical FP32 results across every GPU.
+// ---------------------------------------------------------------------------
+template <int N>
+static __global__ __launch_bounds__(256, 2) void ggml_cuda_ar_pascal_ddio_f32_kernel(
+        float * __restrict__               data,
+        float * __restrict__               my_host,
+        ggml_cuda_ar_ptr_pack<N, float>    host_ptrs,
+        uint32_t *                         my_arr,
+        ggml_cuda_ar_ptr_pack<N, uint32_t> arr_ptrs,
+        int                                count,
+        int                                my_rank,
+        int                                my_active,
+        uint32_t                           token) {
+    constexpr int ARR_STEP = static_cast<int>(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(uint32_t));
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count >> 2;
+    const int tail      = count_vec << 2;
+
+    float4 *       data4    = reinterpret_cast<float4 *>(data);
+    float4 *       my_host4 = reinterpret_cast<float4 *>(my_host);
+    const bool     single   = (count_vec <= gnt);
+
+    float4 cached = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (single) {
+        if (gtid < count_vec) {
+            if (my_active) {
+                cached = data4[gtid];
+            }
+            my_host4[gtid] = cached;
+        }
+    } else {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const float4 v = my_active ? data4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            my_host4[i] = v;
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        my_host[tail + tid] = my_active ? data[tail + tid] : 0.0f;
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    ggml_cuda_ar_pascal_barrier<N>(my_arr, arr_ptrs, tid, bid * ARR_STEP, my_rank, token);
+
+    __syncthreads();
+    __threadfence_system();
+
+    if (single) {
+        if (gtid < count_vec) {
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < N; ++r) {
+                const float4 v = (r == my_rank)
+                    ? cached
+                    : ggml_cuda_ar_ld_cv_f4(reinterpret_cast<const float4 *>(host_ptrs.ptr[r]) + gtid);
+                s0 += v.x;
+                s1 += v.y;
+                s2 += v.z;
+                s3 += v.w;
+            }
+            data4[gtid] = make_float4(s0, s1, s2, s3);
+        }
+    } else {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < N; ++r) {
+                const float4 v = (r == my_rank)
+                    ? (my_active ? data4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f))
+                    : ggml_cuda_ar_ld_cv_f4(reinterpret_cast<const float4 *>(host_ptrs.ptr[r]) + i);
+                s0 += v.x;
+                s1 += v.y;
+                s2 += v.z;
+                s3 += v.w;
+            }
+            data4[i] = make_float4(s0, s1, s2, s3);
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            const float v = (r == my_rank)
+                ? (my_active ? data[tail + tid] : 0.0f)
+                : host_ptrs.ptr[r][tail + tid];
+            s += v;
+        }
+        data[tail + tid] = s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pascal N-GPU Single-Kernel Zero-Sync DDIO AllReduce (F32 data, BF16 wire).
+// Halves PCIe/QPI traffic for medium tensors (or non-P2P large tensors) with
+// zero FP16 overflow risk and deterministic rank-order accumulation.
+// ---------------------------------------------------------------------------
+template <int N>
+static __global__ __launch_bounds__(256, 2) void ggml_cuda_ar_pascal_ddio_bf16wire_kernel(
+        float * __restrict__               data,
+        uint16_t * __restrict__            my_host,
+        ggml_cuda_ar_ptr_pack<N, uint16_t> host_ptrs,
+        uint32_t *                         my_arr,
+        ggml_cuda_ar_ptr_pack<N, uint32_t> arr_ptrs,
+        int                                count,
+        int                                my_rank,
+        int                                my_active,
+        uint32_t                           token) {
+    constexpr int ARR_STEP = static_cast<int>(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(uint32_t));
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count >> 3; // 8 floats <-> 16 bytes (uint4) of BF16
+    const int tail      = count_vec << 3;
+
+    float4 * data4    = reinterpret_cast<float4 *>(data);
+    uint4 *  my_host4 = reinterpret_cast<uint4 *>(my_host);
+
+    for (int i = gtid; i < count_vec; i += gnt) {
+        uint4 pack = make_uint4(0u, 0u, 0u, 0u);
+        if (my_active) {
+            const float4 a = data4[2 * i];
+            const float4 b = data4[2 * i + 1];
+            pack.x = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.x)) |
+                    (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.y)) << 16);
+            pack.y = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.z)) |
+                    (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.w)) << 16);
+            pack.z = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.x)) |
+                    (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.y)) << 16);
+            pack.w = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.z)) |
+                    (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.w)) << 16);
+        }
+        my_host4[i] = pack;
+    }
+    if (bid == 0 && tid < count - tail) {
+        my_host[tail + tid] = my_active ? ggml_cuda_ar_f32_to_bf16_bits(data[tail + tid]) : 0u;
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    ggml_cuda_ar_pascal_barrier<N>(my_arr, arr_ptrs, tid, bid * ARR_STEP, my_rank, token);
+
+    __syncthreads();
+    __threadfence_system();
+
+    for (int i = gtid; i < count_vec; i += gnt) {
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            uint4 pack;
+            if (r == my_rank) {
+                if (my_active) {
+                    const float4 a = data4[2 * i];
+                    const float4 b = data4[2 * i + 1];
+                    pack.x = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.x)) |
+                            (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.y)) << 16);
+                    pack.y = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.z)) |
+                            (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(a.w)) << 16);
+                    pack.z = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.x)) |
+                            (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.y)) << 16);
+                    pack.w = static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.z)) |
+                            (static_cast<uint32_t>(ggml_cuda_ar_f32_to_bf16_bits(b.w)) << 16);
+                } else {
+                    pack = make_uint4(0u, 0u, 0u, 0u);
+                }
+            } else {
+                pack = ggml_cuda_ar_ld_cv_u4(reinterpret_cast<const uint4 *>(host_ptrs.ptr[r]) + i);
+            }
+            s0 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.x));
+            s1 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.x >> 16));
+            s2 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.y));
+            s3 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.y >> 16));
+            s4 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.z));
+            s5 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.z >> 16));
+            s6 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.w));
+            s7 += ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(pack.w >> 16));
+        }
+        data4[2 * i]     = make_float4(s0, s1, s2, s3);
+        data4[2 * i + 1] = make_float4(s4, s5, s6, s7);
+    }
+    if (bid == 0 && tid < count - tail) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            const uint16_t h = (r == my_rank)
+                ? (my_active ? ggml_cuda_ar_f32_to_bf16_bits(data[tail + tid]) : 0u)
+                : host_ptrs.ptr[r][tail + tid];
+            s += ggml_cuda_ar_bf16_bits_to_f32(h);
+        }
+        data[tail + tid] = s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pascal N-GPU Single-Kernel Zero-Sync DDIO AllReduce for native F16 / BF16.
+// ---------------------------------------------------------------------------
+template <int N, typename T>
+static __global__ __launch_bounds__(256, 2) void ggml_cuda_ar_pascal_ddio_16_kernel(
+        T * __restrict__                   data,
+        T * __restrict__                   my_host,
+        ggml_cuda_ar_ptr_pack<N, T>        host_ptrs,
+        uint32_t *                         my_arr,
+        ggml_cuda_ar_ptr_pack<N, uint32_t> arr_ptrs,
+        int                                count,
+        int                                my_rank,
+        int                                my_active,
+        uint32_t                           token) {
+    constexpr int ARR_STEP = static_cast<int>(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(uint32_t));
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count >> 3; // 8 x 2B = 16B
+    const int tail      = count_vec << 3;
+
+    uint4 * data4    = reinterpret_cast<uint4 *>(data);
+    uint4 * my_host4 = reinterpret_cast<uint4 *>(my_host);
+
+    for (int i = gtid; i < count_vec; i += gnt) {
+        my_host4[i] = my_active ? data4[i] : make_uint4(0u, 0u, 0u, 0u);
+    }
+    if (bid == 0 && tid < count - tail) {
+        my_host[tail + tid] = my_active ? data[tail + tid] : ggml_cuda_cast<T>(0.0f);
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    ggml_cuda_ar_pascal_barrier<N>(my_arr, arr_ptrs, tid, bid * ARR_STEP, my_rank, token);
+
+    __syncthreads();
+    __threadfence_system();
+
+    for (int i = gtid; i < count_vec; i += gnt) {
+        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            T vals[8];
+            const uint4 raw = (r == my_rank)
+                ? (my_active ? data4[i] : make_uint4(0u, 0u, 0u, 0u))
+                : ggml_cuda_ar_ld_cv_u4(reinterpret_cast<const uint4 *>(host_ptrs.ptr[r]) + i);
+            memcpy(vals, &raw, sizeof(raw));
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                acc[k] += ggml_cuda_cast<float>(vals[k]);
+            }
+        }
+        T out[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            out[k] = ggml_cuda_cast<T>(acc[k]);
+        }
+        uint4 out4;
+        memcpy(&out4, out, sizeof(out4));
+        data4[i] = out4;
+    }
+    if (bid == 0 && tid < count - tail) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            const T v = (r == my_rank)
+                ? (my_active ? data[tail + tid] : ggml_cuda_cast<T>(0.0f))
+                : host_ptrs.ptr[r][tail + tid];
+            s += ggml_cuda_cast<float>(v);
+        }
+        data[tail + tid] = ggml_cuda_cast<T>(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pascal 2-GPU Direct BAR-P2P Read-Only Reduce-Scatter + AllGather (F32).
+//
+// Exploits GP100 asymmetric PCIe P2P bandwidth: direct BAR1 reads (LDG.E.128)
+// sustain ~10.18 GB/s vs ~7.13 GB/s for BAR writes.  Zero host RAM data copies,
+// zero FP16 overflow risk, 100% bit-exact FP32, zero CUDA events.
+//
+// Each GPU owns a disjoint half of the tensor:
+//   Phase A: pre-barrier (peer's previous kernel finished writing peer_data).
+//   Phase B: read peer's half via LDG.E.128, sum into own half in HBM2.
+//   Phase C: mid-barrier (both reduced halves committed in HBM2).
+//   Phase D: AllGather other half via LDG.E.128 from peer's HBM2.
+//   Phase E: exit-barrier (peer finished reading our half before next kernel).
+// ---------------------------------------------------------------------------
+static __global__ __launch_bounds__(256, 2) void ggml_cuda_ar_pascal_p2p_2gpu_f32_kernel(
+        float * __restrict__       my_data,
+        const float * __restrict__ peer_data,
+        uint32_t *                 my_arr_base,
+        const uint32_t *           peer_arr_base,
+        int                        count,
+        int                        is_hi,
+        int                        my_active,
+        int                        peer_active,
+        uint32_t                   token) {
+    constexpr int ARR_STEP   = static_cast<int>(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(uint32_t));
+    constexpr int PHASE_STEP = GGML_CUDA_AR_PASCAL_MAX_BLOCKS * ARR_STEP;
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count >> 2;
+    const int tail      = count_vec << 2;
+    const int half_vec  = (count_vec + 1) >> 1;
+
+    const int own_base  = is_hi ? half_vec : 0;
+    const int own_n     = is_hi ? (count_vec - half_vec) : half_vec;
+    const int peer_base = is_hi ? 0 : half_vec;
+    const int peer_n    = is_hi ? half_vec : (count_vec - half_vec);
+
+    auto sync_peer = [&](int phase) {
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+            const int off = phase * PHASE_STEP + bid * ARR_STEP;
+            ggml_cuda_ar_signal_set_u32(my_arr_base + off, token);
+            __threadfence_system();
+            const uint32_t * p = peer_arr_base + off;
+            while (ggml_cuda_ar_signal_get_u32(p) != token) {}
+        }
+        __syncthreads();
+        __threadfence_system();
+    };
+
+    float4 *       my4   = reinterpret_cast<float4 *>(my_data);
+    const float4 * peer4 = reinterpret_cast<const float4 *>(peer_data);
+
+    // Phase A: both GPUs finished their prior compute kernel.
+    sync_peer(0);
+
+    // Phase B: Reduce-Scatter over direct BAR1 Read (LDG.E.128).
+    for (int i = gtid; i < own_n; i += gnt) {
+        const int idx = own_base + i;
+        const float4 a = my_active   ? my4[idx]   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 b = peer_active ? peer4[idx] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        my4[idx] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+    }
+    if (!is_hi && bid == 0 && tid < count - tail) {
+        const float a = my_active   ? my_data[tail + tid]   : 0.0f;
+        const float b = peer_active ? peer_data[tail + tid] : 0.0f;
+        my_data[tail + tid] = a + b;
+    }
+
+    // Phase C: both reduced halves committed to HBM2.
+    sync_peer(1);
+
+    // Phase D: AllGather other half via direct BAR1 Read (LDG.E.128).
+    for (int i = gtid; i < peer_n; i += gnt) {
+        const int idx = peer_base + i;
+        my4[idx] = peer4[idx];
+    }
+    if (is_hi && bid == 0 && tid < count - tail) {
+        my_data[tail + tid] = peer_data[tail + tid];
+    }
+
+    // Phase E: ensure peer finished reading our half before our next kernel runs.
+    sync_peer(2);
+}
+
+// ---------------------------------------------------------------------------
+// Pascal 4-GPU Hierarchical Dual-Socket BAR-P2P + Mapped-RAM BF16 AllReduce.
+//
+// Designed for dual-socket PCIe topologies (0<->1 PHB on Socket 0,
+// 2<->3 PHB on CPU1, QPI cross-socket with no cross-socket P2P):
+//   Phase A: intra-socket pre-barrier (p2p_peer).
+//   Phase B: intra-socket Reduce-Scatter via LDG.E.128 BAR Read (@ 10.18 GB/s),
+//            storing own local sum in own HBM2 [own_base..own_base+own_n) AND
+//            streaming BF16 (2x compressed, 0 overflow!) to host_large[my_rank].
+//            (4x less cross-socket QPI traffic than flat 4-GPU F32!)
+//   Phase C: cross-socket barrier (cross_peer).
+//   Phase D: read cross-socket BF16 half from host_large[cross_peer], sum with
+//            own local sum (rounded through BF16 for cross-socket bit-identity),
+//            store final F32 to own HBM2 [own_base..own_base+own_n).
+//   Phase E: intra-socket post-barrier (p2p_peer).
+//   Phase F: intra-socket AllGather other half via LDG.E.128 BAR Read.
+//   Phase G: intra-socket exit-barrier (p2p_peer).
+//
+// Every block bid processes the exact same stripe across all phases -> 100%
+// block-independent, zero grid sync, zero CUDA events, STACK:0!
+// ---------------------------------------------------------------------------
+static __global__ __launch_bounds__(256, 2) void ggml_cuda_ar_pascal_p2p_hier_4gpu_kernel(
+        float * __restrict__          my_data,
+        const float * __restrict__    p2p_peer_data,
+        uint16_t * __restrict__       my_host_bf16,
+        const uint16_t * __restrict__ cross_host_bf16,
+        uint32_t *                    my_arr_base,
+        const uint32_t *              p2p_arr_base,
+        const uint32_t *              cross_arr_base,
+        int                           count,
+        int                           is_hi,
+        int                           my_active,
+        int                           p2p_active,
+        uint32_t                      token) {
+    constexpr int ARR_STEP   = static_cast<int>(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(uint32_t));
+    constexpr int PHASE_STEP = GGML_CUDA_AR_PASCAL_MAX_BLOCKS * ARR_STEP;
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count >> 3; // 8 floats = 2 float4s = 1 uint4 BF16
+    const int tail      = count_vec << 3;
+    const int half_vec  = (count_vec + 1) >> 1;
+
+    const int own_base  = is_hi ? half_vec : 0;
+    const int own_n     = is_hi ? (count_vec - half_vec) : half_vec;
+    const int peer_base = is_hi ? 0 : half_vec;
+    const int peer_n    = is_hi ? half_vec : (count_vec - half_vec);
+
+    auto sync_partner = [&](int phase, const uint32_t * partner_arr_base) {
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+            const int off = phase * PHASE_STEP + bid * ARR_STEP;
+            ggml_cuda_ar_signal_set_u32(my_arr_base + off, token);
+            __threadfence_system();
+            const uint32_t * p = partner_arr_base + off;
+            while (ggml_cuda_ar_signal_get_u32(p) != token) {}
+        }
+        __syncthreads();
+        __threadfence_system();
+    };
+
+    float4 *       my4   = reinterpret_cast<float4 *>(my_data);
+    const float4 * peer4 = reinterpret_cast<const float4 *>(p2p_peer_data);
+    uint4 *        my_h4 = reinterpret_cast<uint4 *>(my_host_bf16);
+    const uint4 *  cr_h4 = reinterpret_cast<const uint4 *>(cross_host_bf16);
+
+    // Phase A: intra-socket pre-barrier.
+    sync_partner(0, p2p_arr_base);
+
+    // Phase B: intra-socket Reduce-Scatter (LDG.E.128 BAR Read) -> HBM2 + BF16 mapped RAM.
+    for (int i = gtid; i < own_n; i += gnt) {
+        const int vidx = 2 * (own_base + i);
+        const float4 a0 = my_active  ? my4[vidx]       : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 a1 = my_active  ? my4[vidx + 1]   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 b0 = p2p_active ? peer4[vidx]     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 b1 = p2p_active ? peer4[vidx + 1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        const uint16_t h0 = ggml_cuda_ar_f32_to_bf16_bits(a0.x + b0.x);
+        const uint16_t h1 = ggml_cuda_ar_f32_to_bf16_bits(a0.y + b0.y);
+        const uint16_t h2 = ggml_cuda_ar_f32_to_bf16_bits(a0.z + b0.z);
+        const uint16_t h3 = ggml_cuda_ar_f32_to_bf16_bits(a0.w + b0.w);
+        const uint16_t h4 = ggml_cuda_ar_f32_to_bf16_bits(a1.x + b1.x);
+        const uint16_t h5 = ggml_cuda_ar_f32_to_bf16_bits(a1.y + b1.y);
+        const uint16_t h6 = ggml_cuda_ar_f32_to_bf16_bits(a1.z + b1.z);
+        const uint16_t h7 = ggml_cuda_ar_f32_to_bf16_bits(a1.w + b1.w);
+
+        my_h4[i] = make_uint4(
+            static_cast<uint32_t>(h0) | (static_cast<uint32_t>(h1) << 16),
+            static_cast<uint32_t>(h2) | (static_cast<uint32_t>(h3) << 16),
+            static_cast<uint32_t>(h4) | (static_cast<uint32_t>(h5) << 16),
+            static_cast<uint32_t>(h6) | (static_cast<uint32_t>(h7) << 16));
+
+        // Store BF16-rounded local partial in own disjoint HBM2 half so both
+        // sockets compute the exact same floating-point sum in Phase D.
+        my4[vidx]     = make_float4(ggml_cuda_ar_bf16_bits_to_f32(h0),
+                                    ggml_cuda_ar_bf16_bits_to_f32(h1),
+                                    ggml_cuda_ar_bf16_bits_to_f32(h2),
+                                    ggml_cuda_ar_bf16_bits_to_f32(h3));
+        my4[vidx + 1] = make_float4(ggml_cuda_ar_bf16_bits_to_f32(h4),
+                                    ggml_cuda_ar_bf16_bits_to_f32(h5),
+                                    ggml_cuda_ar_bf16_bits_to_f32(h6),
+                                    ggml_cuda_ar_bf16_bits_to_f32(h7));
+    }
+    if (!is_hi && bid == 0 && tid < count - tail) {
+        const float a = my_active  ? my_data[tail + tid]       : 0.0f;
+        const float b = p2p_active ? p2p_peer_data[tail + tid] : 0.0f;
+        const uint16_t h = ggml_cuda_ar_f32_to_bf16_bits(a + b);
+        my_host_bf16[(own_n << 3) + tid] = h;
+        my_data[tail + tid] = ggml_cuda_ar_bf16_bits_to_f32(h);
+    }
+
+    // Phase C: cross-socket barrier.
+    sync_partner(1, cross_arr_base);
+
+    // Phase D: read cross-socket BF16 half from mapped RAM and accumulate in HBM2.
+    for (int i = gtid; i < own_n; i += gnt) {
+        const int vidx = 2 * (own_base + i);
+        const uint4  cr = cr_h4[i];
+        const float4 l0 = my4[vidx];
+        const float4 l1 = my4[vidx + 1];
+
+        my4[vidx] = make_float4(
+            l0.x + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.x)),
+            l0.y + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.x >> 16)),
+            l0.z + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.y)),
+            l0.w + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.y >> 16)));
+        my4[vidx + 1] = make_float4(
+            l1.x + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.z)),
+            l1.y + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.z >> 16)),
+            l1.z + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.w)),
+            l1.w + ggml_cuda_ar_bf16_bits_to_f32(static_cast<uint16_t>(cr.w >> 16)));
+    }
+    if (!is_hi && bid == 0 && tid < count - tail) {
+        my_data[tail + tid] += ggml_cuda_ar_bf16_bits_to_f32(cross_host_bf16[(own_n << 3) + tid]);
+    }
+
+    // Phase E: intra-socket post-barrier (both reduced halves ready in HBM2).
+    sync_partner(2, p2p_arr_base);
+
+    // Phase F: intra-socket AllGather other half via direct BAR1 Read (LDG.E.128).
+    for (int i = gtid; i < peer_n; i += gnt) {
+        const int vidx = 2 * (peer_base + i);
+        my4[vidx]     = peer4[vidx];
+        my4[vidx + 1] = peer4[vidx + 1];
+    }
+    if (is_hi && bid == 0 && tid < count - tail) {
+        my_data[tail + tid] = p2p_peer_data[tail + tid];
+    }
+
+    // Phase G: intra-socket exit-barrier (ensure peer finished reading our half).
+    sync_partner(3, p2p_arr_base);
+}
 
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
@@ -308,12 +925,22 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     uint64_t call_count;
-    bool     pascal;       // pre-Volta host-staged mode (no P2P between the two GPUs)
-    size_t   host_max;     // pascal: largest exchange (bytes) taken by this path
+    bool     pascal;       // pre-Volta fast multi-GPU mode (2x or 4x Pascal sm_60)
+    bool     pascal_p2p_pairs; // true when GPUs form bidirectional P2P pairs (0<->1, 2<->3)
+    bool     pascal_host_max_set;
+    size_t   host_max;     // pascal: optional cap (GGML_CUDA_AR_HOST_MAX)
+    size_t   p2p_threshold; // pascal: byte threshold above which BAR-P2P path is used
+    size_t   pascal_bf16_threshold; // pascal: byte threshold for BF16 wire on DDIO path (0 = always F32)
+    int      pascal_blocks_override; // optional GGML_CUDA_AR_PASCAL_BLOCKS override
+    int      p2p_peer[GGML_CUDA_MAX_DEVICES];   // intra-socket P2P partner rank (-1 if none)
+    int      cross_peer[GGML_CUDA_MAX_DEVICES]; // cross-socket partner rank for 4-GPU hier (-1 if none)
+    int      is_hi_half[GGML_CUDA_MAX_DEVICES]; // 0 or 1 within P2P pair
+    uint64_t pascal_call_count;
+    uint32_t pascal_token;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
-    ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
+    ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine or 4-GPU hier BF16)
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
     ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
@@ -334,7 +961,7 @@ struct ggml_cuda_ar_pipeline {
 
     // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints.  Mapped pinned
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
-    // Use ggml_cuda_ar_arrival_ptr() to index.
+    // Use ggml_cuda_ar_arrival_ptr() / ggml_cuda_ar_pascal_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
 };
 
@@ -344,6 +971,41 @@ static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot,
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
+}
+
+static uint32_t * ggml_cuda_ar_pascal_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank, int phase = 0) {
+    const size_t offset = (((size_t)slot * p->n_devices + rank) * GGML_CUDA_AR_PASCAL_PHASES + phase) *
+                          GGML_CUDA_AR_PASCAL_MAX_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<uint32_t *>(p->arrival.dev + offset);
+}
+
+static uint32_t ggml_cuda_ar_pascal_next_token(ggml_cuda_ar_pipeline * p, int & out_slot) {
+    out_slot = static_cast<int>(p->pascal_call_count % GGML_CUDA_AR_PASCAL_POOL_SIZE);
+    p->pascal_call_count++;
+    p->pascal_token++;
+    if (p->pascal_token == 0) {
+        p->pascal_token = 1;
+    }
+    return p->pascal_token;
+}
+
+static int ggml_cuda_ar_pascal_choose_blocks(const ggml_cuda_ar_pipeline * p, size_t chunk_bytes) {
+    if (p->pascal_blocks_override > 0) {
+        return std::min(p->pascal_blocks_override, GGML_CUDA_AR_PASCAL_MAX_BLOCKS);
+    }
+    if (chunk_bytes <= 32 * 1024) {
+        return 1;
+    }
+    if (chunk_bytes <= 64 * 1024) {
+        return 2;
+    }
+    if (chunk_bytes <= 128 * 1024) {
+        return 4;
+    }
+    if (chunk_bytes <= 256 * 1024) {
+        return 8;
+    }
+    return GGML_CUDA_AR_PASCAL_MAX_BLOCKS;
 }
 
 static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
@@ -400,32 +1062,38 @@ static void ggml_cuda_ar_wait_for_compute(
 
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
-    if (n_devices != 2) {
-        GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 (got %zu); "
+    if (n_devices != 2 && n_devices != 4) {
+        GGML_LOG_DEBUG("%s: internal AllReduce supports n_devices=2 or 4 (got %zu); "
                        "falling back\n", __func__, n_devices);
         return nullptr;
     }
 
-    // The chunked kernel sleeps with __nanosleep (NVIDIA, sm70+) or
-    // __builtin_amdgcn_s_sleep (AMD) while it waits. Pascal has no sleep and
-    // spins instead; it takes this path only when the two GPUs cannot reach
-    // each other directly (no P2P, e.g. one card behind the chipset), where
-    // the alternative is a driver-staged cudaMemcpyPeer per exchange.
-    bool pascal_no_p2p = n_devices == 2 && devices[0] != devices[1];
-    for (size_t i = 0; i < n_devices && pascal_no_p2p; ++i) {
+    // Detect Pascal (sm_60 / sm_61) multi-GPU configuration with distinct physical GPUs.
+    // Supports both 2-GPU and 4-GPU setups (with or without intra-socket P2P pairs).
+    bool pascal_fast = true;
+    for (size_t i = 0; i < n_devices && pascal_fast; ++i) {
         const int cc = ggml_cuda_info().devices[devices[i]].cc;
-        int can = 0;
-        CUDA_CHECK(cudaDeviceCanAccessPeer(&can, ggml_cuda_info().devices[devices[i]].physical_device,
-                                           ggml_cuda_info().devices[devices[1 - i]].physical_device));
-        pascal_no_p2p = cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA && !can &&
-                        ggml_cuda_info().devices[devices[0]].physical_device != ggml_cuda_info().devices[devices[1]].physical_device;
+        pascal_fast = (cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA);
+        for (size_t j = 0; j < i && pascal_fast; ++j) {
+            if (ggml_cuda_info().devices[devices[i]].physical_device ==
+                ggml_cuda_info().devices[devices[j]].physical_device) {
+                pascal_fast = false;
+            }
+        }
     }
     if (const char * env = getenv("GGML_CUDA_AR_HOST")) {
-        pascal_no_p2p = pascal_no_p2p && atoi(env) != 0;
+        pascal_fast = pascal_fast && atoi(env) != 0;
     }
+
+    if (!pascal_fast && n_devices != 2) {
+        GGML_LOG_DEBUG("%s: non-Pascal internal AllReduce only supports n_devices=2 (got %zu); "
+                       "falling back\n", __func__, n_devices);
+        return nullptr;
+    }
+
     for (size_t i = 0; i < n_devices; ++i) {
         const int cc = ggml_cuda_info().devices[devices[i]].cc;
-        if (cc < GGML_CUDA_CC_VOLTA && !pascal_no_p2p) {
+        if (cc < GGML_CUDA_CC_VOLTA && !pascal_fast) {
             GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
                            "(device %d has cc=%d); falling back\n",
                            __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
@@ -434,8 +1102,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     auto * p = new ggml_cuda_ar_pipeline{};
-    p->n_devices        = n_devices;
-    p->copy_bytes       = GGML_CUDA_AR_COPY_MAX_BYTES;
+    p->n_devices        = (int) n_devices;
+    p->copy_bytes       = pascal_fast ? (GGML_CUDA_AR_PASCAL_POOL_SIZE * GGML_CUDA_AR_PASCAL_HIER_SLICE) : GGML_CUDA_AR_COPY_MAX_BYTES;
     p->copy_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_THRESHOLD", GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT);
     // 0 = use the per-call heuristic (default).  Non-zero env value forces a
     // fixed chunk size for diagnostics, with a floor at COPY_CHUNK_BYTES_MIN.
@@ -445,16 +1113,87 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
-    // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
-    // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
-    // byte threshold to opt out for small tensors.
-    // Pascal: no BF16 round trip (lossy); partials go over the wire in f32, or in f16 when the
-    // tensor-parallel f16 probe found them f16-exact (see ggml_cuda_ar_allreduce's wire_f16)
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", pascal_no_p2p ? 0 : 1);
-    p->pascal           = pascal_no_p2p;
-    p->host_max         = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HOST_MAX", GGML_CUDA_AR_MAX_BYTES);
+    // Default 1 for Volta+: BF16 round-trip is always on for F32 inputs.
+    // Pascal: bit-exact FP32 wire below 128 KB (latency-bound decode), BF16 wire above.
+    p->bf16_threshold         = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", pascal_fast ? 0 : 1);
+    p->pascal                 = pascal_fast;
+    p->pascal_host_max_set    = getenv("GGML_CUDA_AR_HOST_MAX") != nullptr;
+    p->host_max               = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HOST_MAX", GGML_CUDA_AR_MAX_BYTES);
+    p->p2p_threshold          = ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P_THRESHOLD", 256 * 1024);
+    p->pascal_bf16_threshold  = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 128 * 1024);
+    p->pascal_blocks_override = (int) ggml_cuda_ar_env_u64("GGML_CUDA_AR_PASCAL_BLOCKS", 0);
     for (size_t i = 0; i < n_devices; ++i) {
-        p->devices[i] = devices[i];
+        p->devices[i]    = devices[i];
+        p->p2p_peer[i]   = -1;
+        p->cross_peer[i] = -1;
+        p->is_hi_half[i] = 0;
+    }
+
+    // On Pascal, probe bidirectional P2P topology to discover intra-socket pairs
+    // (e.g. (0,1) on CPU0 and (2,3) on CPU1) and enable direct peer access for BAR1 reads.
+    if (p->pascal) {
+        const bool p2p_allowed = !getenv("GGML_CUDA_AR_P2P") || atoi(getenv("GGML_CUDA_AR_P2P")) != 0;
+        auto can_p2p = [&](int r_a, int r_b) -> bool {
+            const int pa = ggml_cuda_info().devices[p->devices[r_a]].physical_device;
+            const int pb = ggml_cuda_info().devices[p->devices[r_b]].physical_device;
+            int c1 = 0, c2 = 0;
+            if (cudaDeviceCanAccessPeer(&c1, pa, pb) != cudaSuccess ||
+                cudaDeviceCanAccessPeer(&c2, pb, pa) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+            return c1 != 0 && c2 != 0;
+        };
+
+        if (p2p_allowed && n_devices == 2 && can_p2p(0, 1)) {
+            p->p2p_peer[0] = 1; p->is_hi_half[0] = 0;
+            p->p2p_peer[1] = 0; p->is_hi_half[1] = 1;
+            p->pascal_p2p_pairs = true;
+        } else if (p2p_allowed && n_devices == 4) {
+            int partner0 = -1;
+            for (int r = 1; r < 4; ++r) {
+                if (can_p2p(0, r)) {
+                    partner0 = r;
+                    break;
+                }
+            }
+            if (partner0 > 0) {
+                int rem[2] = {-1, -1};
+                int k = 0;
+                for (int r = 1; r < 4; ++r) {
+                    if (r != partner0) {
+                        rem[k++] = r;
+                    }
+                }
+                if (rem[0] >= 0 && rem[1] >= 0 && can_p2p(rem[0], rem[1])) {
+                    // Pair 0: (0, partner0), Pair 1: (rem[0], rem[1]).
+                    // Cross-socket partners own the same half: 0 <-> rem[0] (lo), partner0 <-> rem[1] (hi).
+                    p->p2p_peer[0]        = partner0; p->cross_peer[0]        = rem[0];   p->is_hi_half[0]        = 0;
+                    p->p2p_peer[partner0] = 0;        p->cross_peer[partner0] = rem[1];   p->is_hi_half[partner0] = 1;
+                    p->p2p_peer[rem[0]]   = rem[1];   p->cross_peer[rem[0]]   = 0;        p->is_hi_half[rem[0]]   = 0;
+                    p->p2p_peer[rem[1]]   = rem[0];   p->cross_peer[rem[1]]   = partner0; p->is_hi_half[rem[1]]   = 1;
+                    p->pascal_p2p_pairs = true;
+                }
+            }
+        }
+
+        if (p->pascal_p2p_pairs) {
+            for (size_t i = 0; i < n_devices; ++i) {
+                const int peer = p->p2p_peer[i];
+                const int phys_peer = ggml_cuda_info().devices[p->devices[peer]].physical_device;
+                ggml_cuda_set_device(p->devices[i]);
+                cudaError_t rc = cudaDeviceEnablePeerAccess(phys_peer, 0);
+                if (rc == cudaErrorPeerAccessAlreadyEnabled) {
+                    (void) cudaGetLastError();
+                } else if (rc != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    GGML_LOG_WARN("%s: cudaDeviceEnablePeerAccess(%d -> %d) failed (%s); disabling BAR-P2P path\n",
+                                  __func__, p->devices[i], p->devices[peer], cudaGetErrorString(rc));
+                    p->pascal_p2p_pairs = false;
+                    break;
+                }
+            }
+        }
     }
 
     // Per-device streams and event pools.
@@ -470,59 +1209,56 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
         p->streams[i] = stream;
 
-        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
-            bool ok =
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].app, cudaEventDisableTiming) == cudaSuccess &&
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].h2d, cudaEventDisableTiming) == cudaSuccess &&
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].ker, cudaEventDisableTiming) == cudaSuccess;
-            for (int c = 0; ok && c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
-                ok = cudaEventCreateWithFlags(&p->ev_pool[i][s].cpy[c], cudaEventDisableTiming) == cudaSuccess;
+        if (!p->pascal) {
+            for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+                bool ok =
+                    cudaEventCreateWithFlags(&p->ev_pool[i][s].app, cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&p->ev_pool[i][s].h2d, cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&p->ev_pool[i][s].ker, cudaEventDisableTiming) == cudaSuccess;
+                for (int c = 0; ok && c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
+                    ok = cudaEventCreateWithFlags(&p->ev_pool[i][s].cpy[c], cudaEventDisableTiming) == cudaSuccess;
+                }
+                if (!ok) {
+                    GGML_LOG_ERROR("%s: cudaEventCreate failed for device %d slot %d\n",
+                                   __func__, p->devices[i], s);
+                    ggml_cuda_ar_pipeline_free(p);
+                    return nullptr;
+                }
             }
-            if (!ok) {
-                GGML_LOG_ERROR("%s: cudaEventCreate failed for device %d slot %d\n",
-                               __func__, p->devices[i], s);
+
+            if (cudaEventCreateWithFlags(&p->host_large_read_done[i], cudaEventDisableTiming) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaEventCreate for host_large_read_done failed for device %d\n",
+                               __func__, p->devices[i]);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            if (cudaEventCreateWithFlags(&p->dev_tmp_kernel_done[i], cudaEventDisableTiming) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaEventCreate for dev_tmp_kernel_done failed for device %d\n",
+                               __func__, p->devices[i]);
                 ggml_cuda_ar_pipeline_free(p);
                 return nullptr;
             }
         }
-
-        if (cudaEventCreateWithFlags(&p->host_large_read_done[i], cudaEventDisableTiming) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaEventCreate for host_large_read_done failed for device %d\n",
-                           __func__, p->devices[i]);
-            ggml_cuda_ar_pipeline_free(p);
-            return nullptr;
-        }
-        if (cudaEventCreateWithFlags(&p->dev_tmp_kernel_done[i], cudaEventDisableTiming) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaEventCreate for dev_tmp_kernel_done failed for device %d\n",
-                           __func__, p->devices[i]);
-            ggml_cuda_ar_pipeline_free(p);
-            return nullptr;
-        }
     }
 
-    // Arrival ring: cache-line padded so each GPU's int is on its own line.
-    const size_t arrival_bytes =
-        (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
-        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    // Arrival ring: cache-line padded so each GPU/block/phase int is on its own line.
+    const size_t arrival_bytes = p->pascal
+        ? ((size_t) GGML_CUDA_AR_PASCAL_POOL_SIZE * n_devices *
+           GGML_CUDA_AR_PASCAL_PHASES * GGML_CUDA_AR_PASCAL_MAX_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE)
+        : ((size_t) GGML_CUDA_AR_POOL_SIZE * n_devices *
+           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE);
     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
                        __func__, arrival_bytes);
         ggml_cuda_ar_pipeline_free(p);
         return nullptr;
     }
-    ggml_cuda_set_device(p->devices[0]);
-    if (cudaMemset(p->arrival.dev, 0, arrival_bytes) != cudaSuccess) {
-        GGML_LOG_ERROR("%s: cudaMemset for arrival ring failed (%zu bytes)\n",
-                       __func__, arrival_bytes);
-        ggml_cuda_ar_pipeline_free(p);
-        return nullptr;
-    }
+    memset(p->arrival.host, 0, arrival_bytes);
 
-    // Per-device pinned staging buffers -- POOL_SIZE-deep ring so the chunked-
-    // kernel can write the next slot's data while the peer is still reading
-    // the previous slot's. Indexed by (slot * buf_bytes) at the call site.
+    // Per-device pinned staging buffers.
     p->buf_bytes = GGML_CUDA_AR_MAX_BYTES;
-    const size_t host_buf_total = (size_t) GGML_CUDA_AR_POOL_SIZE * p->buf_bytes;
+    const size_t pool_depth = p->pascal ? GGML_CUDA_AR_PASCAL_POOL_SIZE : GGML_CUDA_AR_POOL_SIZE;
+    const size_t host_buf_total = pool_depth * p->buf_bytes;
     for (size_t i = 0; i < n_devices; ++i) {
         if (p->host_buf[i].alloc(host_buf_total) != cudaSuccess) {
             GGML_LOG_ERROR("%s: alloc for staging failed (%zu bytes)\n",
@@ -532,32 +1268,196 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
-    // Copy-engine path: pinned host staging + device scratch, sized for the
-    // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
-    // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
-    // cross-stream wait in copy_impl on the prior AR's add_kernel-done event.
-    for (size_t i = 0; i < n_devices; ++i) {
-        ggml_cuda_set_device(p->devices[i]);
-        if (p->host_large[i].alloc(p->copy_bytes) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: alloc for large staging failed (%zu bytes)\n",
-                           __func__, p->copy_bytes);
-            ggml_cuda_ar_pipeline_free(p);
-            return nullptr;
+    // Large staging buffers:
+    //  * Volta+: host_large (32 MB) + dev_tmp (32 MB) for copy-engine path.
+    //  * Pascal 4-GPU P2P: host_large (4 slots x 4 MB BF16 = 16 MB/GPU) for cross-socket half exchange; zero dev_tmp!
+    //  * Pascal 2-GPU P2P or non-P2P: no host_large / dev_tmp needed!
+    if (!p->pascal) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (p->host_large[i].alloc(p->copy_bytes) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: alloc for large staging failed (%zu bytes)\n",
+                               __func__, p->copy_bytes);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            if (cudaMalloc(reinterpret_cast<void **>(&p->dev_tmp[i]), p->copy_bytes) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaMalloc for copy scratch failed (%zu bytes) on device %d\n",
+                               __func__, p->copy_bytes, p->devices[i]);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
         }
-        if (cudaMalloc(reinterpret_cast<void **>(&p->dev_tmp[i]), p->copy_bytes) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaMalloc for copy scratch failed (%zu bytes) on device %d\n",
-                           __func__, p->copy_bytes, p->devices[i]);
-            ggml_cuda_ar_pipeline_free(p);
-            return nullptr;
+    } else if (n_devices == 4 && p->pascal_p2p_pairs) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            if (p->host_large[i].alloc(p->copy_bytes) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: alloc for 4-GPU hier staging failed (%zu bytes)\n",
+                               __func__, p->copy_bytes);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+        }
+    }
+
+    // Eagerly warm up and self-verify every spinning Pascal kernel on all GPUs so
+    // CUDA_MODULE_LOADING=LAZY can never serialize or stall a live spin barrier.
+    if (p->pascal) {
+        float * dummy[GGML_CUDA_MAX_DEVICES] = {};
+        bool alloc_ok = true;
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (cudaMalloc(&dummy[i], 64) != cudaSuccess ||
+                cudaMemsetAsync(dummy[i], 0, 64, p->streams[i]) != cudaSuccess) {
+                alloc_ok = false;
+                break;
+            }
+        }
+        if (alloc_ok) {
+            auto run_warmup_ddio = [&]() {
+                int slot = 0;
+                uint32_t tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                if (n_devices == 2) {
+                    ggml_cuda_ar_ptr_pack<2, float> h_f32;
+                    ggml_cuda_ar_ptr_pack<2, uint16_t> h_bf16;
+                    ggml_cuda_ar_ptr_pack<2, half> h_f16;
+                    ggml_cuda_ar_ptr_pack<2, nv_bfloat16> h_nb16;
+                    ggml_cuda_ar_ptr_pack<2, uint32_t> arr;
+                    for (int r = 0; r < 2; ++r) {
+                        uint8_t * hb = p->host_buf[r].dev + (size_t) slot * p->buf_bytes;
+                        h_f32.ptr[r]  = reinterpret_cast<float *>(hb);
+                        h_bf16.ptr[r] = reinterpret_cast<uint16_t *>(hb);
+                        h_f16.ptr[r]  = reinterpret_cast<half *>(hb);
+                        h_nb16.ptr[r] = reinterpret_cast<nv_bfloat16 *>(hb);
+                        arr.ptr[r]    = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 2; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_f32_kernel<2><<<1, 256, 0, p->streams[r]>>>(dummy[r], h_f32.ptr[r], h_f32, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                    for (int r = 0; r < 2; ++r) {
+                        h_bf16.ptr[r] = reinterpret_cast<uint16_t *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+                        arr.ptr[r]    = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 2; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_bf16wire_kernel<2><<<1, 256, 0, p->streams[r]>>>(dummy[r], h_bf16.ptr[r], h_bf16, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                    for (int r = 0; r < 2; ++r) {
+                        h_f16.ptr[r] = reinterpret_cast<half *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+                        arr.ptr[r]   = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 2; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_16_kernel<2, half><<<1, 256, 0, p->streams[r]>>>(reinterpret_cast<half *>(dummy[r]), h_f16.ptr[r], h_f16, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                    for (int r = 0; r < 2; ++r) {
+                        h_nb16.ptr[r] = reinterpret_cast<nv_bfloat16 *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+                        arr.ptr[r]    = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 2; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_16_kernel<2, nv_bfloat16><<<1, 256, 0, p->streams[r]>>>(reinterpret_cast<nv_bfloat16 *>(dummy[r]), h_nb16.ptr[r], h_nb16, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    if (p->pascal_p2p_pairs) {
+                        tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                        for (int r = 0; r < 2; ++r) {
+                            const int peer = p->p2p_peer[r];
+                            ggml_cuda_set_device(p->devices[r]);
+                            ggml_cuda_ar_pascal_p2p_2gpu_f32_kernel<<<1, 256, 0, p->streams[r]>>>(
+                                dummy[r], dummy[peer],
+                                ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0),
+                                ggml_cuda_ar_pascal_arrival_ptr(p, slot, peer, 0),
+                                16, p->is_hi_half[r], 1, 1, tok);
+                        }
+                    }
+                } else {
+                    ggml_cuda_ar_ptr_pack<4, float> h_f32;
+                    ggml_cuda_ar_ptr_pack<4, uint16_t> h_bf16;
+                    ggml_cuda_ar_ptr_pack<4, half> h_f16;
+                    ggml_cuda_ar_ptr_pack<4, nv_bfloat16> h_nb16;
+                    ggml_cuda_ar_ptr_pack<4, uint32_t> arr;
+                    for (int r = 0; r < 4; ++r) {
+                        uint8_t * hb = p->host_buf[r].dev + (size_t) slot * p->buf_bytes;
+                        h_f32.ptr[r]  = reinterpret_cast<float *>(hb);
+                        arr.ptr[r]    = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_f32_kernel<4><<<1, 256, 0, p->streams[r]>>>(dummy[r], h_f32.ptr[r], h_f32, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                    for (int r = 0; r < 4; ++r) {
+                        h_bf16.ptr[r] = reinterpret_cast<uint16_t *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+                        arr.ptr[r]    = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_bf16wire_kernel<4><<<1, 256, 0, p->streams[r]>>>(dummy[r], h_bf16.ptr[r], h_bf16, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                    for (int r = 0; r < 4; ++r) {
+                        h_f16.ptr[r] = reinterpret_cast<half *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+                        arr.ptr[r]   = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_16_kernel<4, half><<<1, 256, 0, p->streams[r]>>>(reinterpret_cast<half *>(dummy[r]), h_f16.ptr[r], h_f16, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                    for (int r = 0; r < 4; ++r) {
+                        h_nb16.ptr[r] = reinterpret_cast<nv_bfloat16 *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+                        arr.ptr[r]    = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        ggml_cuda_set_device(p->devices[r]);
+                        ggml_cuda_ar_pascal_ddio_16_kernel<4, nv_bfloat16><<<1, 256, 0, p->streams[r]>>>(reinterpret_cast<nv_bfloat16 *>(dummy[r]), h_nb16.ptr[r], h_nb16, arr.ptr[r], arr, 16, r, 1, tok);
+                    }
+                    if (p->pascal_p2p_pairs) {
+                        tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                        for (int r = 0; r < 4; ++r) {
+                            const int peer  = p->p2p_peer[r];
+                            const int cross = p->cross_peer[r];
+                            ggml_cuda_set_device(p->devices[r]);
+                            ggml_cuda_ar_pascal_p2p_hier_4gpu_kernel<<<1, 256, 0, p->streams[r]>>>(
+                                dummy[r], dummy[peer],
+                                reinterpret_cast<uint16_t *>(p->host_large[r].dev     + (size_t) slot * GGML_CUDA_AR_PASCAL_HIER_SLICE),
+                                reinterpret_cast<const uint16_t *>(p->host_large[cross].dev + (size_t) slot * GGML_CUDA_AR_PASCAL_HIER_SLICE),
+                                ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0),
+                                ggml_cuda_ar_pascal_arrival_ptr(p, slot, peer, 0),
+                                ggml_cuda_ar_pascal_arrival_ptr(p, slot, cross, 0),
+                                16, p->is_hi_half[r], 1, 1, tok);
+                        }
+                    }
+                }
+            };
+            run_warmup_ddio();
+            for (size_t i = 0; i < n_devices; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+            }
+        }
+        for (size_t i = 0; i < n_devices; ++i) {
+            if (dummy[i]) {
+                ggml_cuda_set_device(p->devices[i]);
+                CUDA_CHECK(cudaFree(dummy[i]));
+            }
         }
     }
 
     if (p->pascal) {
-        GGML_LOG_INFO("%s: no P2P between the GPUs; tensor-parallel exchanges are staged through pinned host memory\n", __func__);
+        GGML_LOG_INFO("%s: initialized Pascal zero-sync AllReduce pipeline: %zu GPUs, "
+                      "DDIO staging %zu KB x %d slots, BAR-P2P pairs=%s (p2p_thresh=%zu KB, bf16_thresh=%zu KB)\n",
+                      __func__, n_devices, p->buf_bytes >> 10, GGML_CUDA_AR_PASCAL_POOL_SIZE,
+                      p->pascal_p2p_pairs ? "ON" : "OFF",
+                      p->p2p_threshold >> 10, p->pascal_bf16_threshold >> 10);
+    } else {
+        GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
+                      "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
+                      __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
     }
-    GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
 
     return p;
 }
@@ -768,6 +1668,159 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
     return ok;
 }
 
+template <int N>
+static bool ggml_cuda_ar_pascal_dispatch_n(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors,
+        ggml_type               input_type,
+        int64_t                 ne,
+        size_t                  input_nbytes,
+        const bool              compute_flag[GGML_CUDA_MAX_DEVICES]) {
+    cudaStream_t streams[N];
+    for (int r = 0; r < N; ++r) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[r]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[r]);
+        streams[r] = cuda_ctx->stream();
+    }
+
+    // Large F32 tensors on P2P-paired Pascal GPUs: use direct BAR1-Read P2P path!
+    if (input_type == GGML_TYPE_F32 && p->pascal_p2p_pairs && input_nbytes > p->p2p_threshold) {
+        if constexpr (N == 2) {
+            constexpr int64_t MAX_ELEMS = (1LL << 28); // 1 GB per launch
+            for (int64_t off = 0; off < ne; off += MAX_ELEMS) {
+                const int chunk_elems = static_cast<int>(std::min(MAX_ELEMS, ne - off));
+                int slot = 0;
+                const uint32_t tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                const int nb = p->pascal_blocks_override > 0
+                    ? std::min(p->pascal_blocks_override, GGML_CUDA_AR_PASCAL_MAX_BLOCKS)
+                    : GGML_CUDA_AR_PASCAL_MAX_BLOCKS;
+                for (int r = 0; r < 2; ++r) {
+                    const int peer = p->p2p_peer[r];
+                    ggml_cuda_set_device(p->devices[r]);
+                    ggml_cuda_ar_pascal_p2p_2gpu_f32_kernel<<<nb, 256, 0, streams[r]>>>(
+                        static_cast<float *>(tensors[r]->data) + off,
+                        static_cast<const float *>(tensors[peer]->data) + off,
+                        ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0),
+                        ggml_cuda_ar_pascal_arrival_ptr(p, slot, peer, 0),
+                        chunk_elems,
+                        p->is_hi_half[r],
+                        compute_flag[r] ? 1 : 0,
+                        compute_flag[peer] ? 1 : 0,
+                        tok);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            }
+            return true;
+        } else if constexpr (N == 4) {
+            // Each GPU writes half the chunk in BF16 (2 bytes/elem) -> 1 byte per total elem,
+            // so 4 MB slice holds ~4M floats (~16 MB F32) per single launch!
+            constexpr int64_t MAX_ELEMS = ((static_cast<int64_t>(GGML_CUDA_AR_PASCAL_HIER_SLICE) - 64) & ~15LL);
+            for (int64_t off = 0; off < ne; off += MAX_ELEMS) {
+                const int chunk_elems = static_cast<int>(std::min(MAX_ELEMS, ne - off));
+                int slot = 0;
+                const uint32_t tok = ggml_cuda_ar_pascal_next_token(p, slot);
+                const int nb = p->pascal_blocks_override > 0
+                    ? std::min(p->pascal_blocks_override, GGML_CUDA_AR_PASCAL_MAX_BLOCKS)
+                    : GGML_CUDA_AR_PASCAL_MAX_BLOCKS;
+                for (int r = 0; r < 4; ++r) {
+                    const int peer  = p->p2p_peer[r];
+                    const int cross = p->cross_peer[r];
+                    ggml_cuda_set_device(p->devices[r]);
+                    ggml_cuda_ar_pascal_p2p_hier_4gpu_kernel<<<nb, 256, 0, streams[r]>>>(
+                        static_cast<float *>(tensors[r]->data) + off,
+                        static_cast<const float *>(tensors[peer]->data) + off,
+                        reinterpret_cast<uint16_t *>(p->host_large[r].dev     + (size_t) slot * GGML_CUDA_AR_PASCAL_HIER_SLICE),
+                        reinterpret_cast<const uint16_t *>(p->host_large[cross].dev + (size_t) slot * GGML_CUDA_AR_PASCAL_HIER_SLICE),
+                        ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0),
+                        ggml_cuda_ar_pascal_arrival_ptr(p, slot, peer, 0),
+                        ggml_cuda_ar_pascal_arrival_ptr(p, slot, cross, 0),
+                        chunk_elems,
+                        p->is_hi_half[r],
+                        compute_flag[r] ? 1 : 0,
+                        compute_flag[peer] ? 1 : 0,
+                        tok);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            }
+            return true;
+        }
+    }
+
+    // Small/medium latency-bound tensors (or non-P2P fallback): zero-sync DDIO path.
+    const bool use_bf16_wire = (input_type == GGML_TYPE_F32) &&
+                               (p->pascal_bf16_threshold > 0) &&
+                               (input_nbytes >= p->pascal_bf16_threshold);
+    const size_t wire_elem_bytes = use_bf16_wire ? sizeof(uint16_t) : ggml_type_size(input_type);
+    const int64_t max_chunk_elems = static_cast<int64_t>((p->buf_bytes / wire_elem_bytes) & ~15ULL);
+    const size_t input_elem_bytes = ggml_type_size(input_type);
+
+    for (int64_t off = 0; off < ne; off += max_chunk_elems) {
+        const int chunk_elems = static_cast<int>(std::min(max_chunk_elems, ne - off));
+        const size_t chunk_wire_bytes = (size_t) chunk_elems * wire_elem_bytes;
+        const int nb = ggml_cuda_ar_pascal_choose_blocks(p, chunk_wire_bytes);
+
+        int slot = 0;
+        const uint32_t tok = ggml_cuda_ar_pascal_next_token(p, slot);
+
+        ggml_cuda_ar_ptr_pack<N, uint32_t> arr;
+        for (int r = 0; r < N; ++r) {
+            arr.ptr[r] = ggml_cuda_ar_pascal_arrival_ptr(p, slot, r, 0);
+        }
+
+        if (input_type == GGML_TYPE_F32 && !use_bf16_wire) {
+            ggml_cuda_ar_ptr_pack<N, float> h_ptrs;
+            for (int r = 0; r < N; ++r) {
+                h_ptrs.ptr[r] = reinterpret_cast<float *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+            }
+            for (int r = 0; r < N; ++r) {
+                ggml_cuda_set_device(p->devices[r]);
+                float * data = static_cast<float *>(tensors[r]->data) + off;
+                ggml_cuda_ar_pascal_ddio_f32_kernel<N><<<nb, 256, 0, streams[r]>>>(
+                    data, h_ptrs.ptr[r], h_ptrs, arr.ptr[r], arr, chunk_elems, r, compute_flag[r] ? 1 : 0, tok);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        } else if (input_type == GGML_TYPE_F32 && use_bf16_wire) {
+            ggml_cuda_ar_ptr_pack<N, uint16_t> h_ptrs;
+            for (int r = 0; r < N; ++r) {
+                h_ptrs.ptr[r] = reinterpret_cast<uint16_t *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+            }
+            for (int r = 0; r < N; ++r) {
+                ggml_cuda_set_device(p->devices[r]);
+                float * data = static_cast<float *>(tensors[r]->data) + off;
+                ggml_cuda_ar_pascal_ddio_bf16wire_kernel<N><<<nb, 256, 0, streams[r]>>>(
+                    data, h_ptrs.ptr[r], h_ptrs, arr.ptr[r], arr, chunk_elems, r, compute_flag[r] ? 1 : 0, tok);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        } else if (input_type == GGML_TYPE_F16) {
+            ggml_cuda_ar_ptr_pack<N, half> h_ptrs;
+            for (int r = 0; r < N; ++r) {
+                h_ptrs.ptr[r] = reinterpret_cast<half *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+            }
+            for (int r = 0; r < N; ++r) {
+                ggml_cuda_set_device(p->devices[r]);
+                half * data = reinterpret_cast<half *>(static_cast<char *>(tensors[r]->data) + off * (int64_t) input_elem_bytes);
+                ggml_cuda_ar_pascal_ddio_16_kernel<N, half><<<nb, 256, 0, streams[r]>>>(
+                    data, h_ptrs.ptr[r], h_ptrs, arr.ptr[r], arr, chunk_elems, r, compute_flag[r] ? 1 : 0, tok);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        } else {
+            ggml_cuda_ar_ptr_pack<N, nv_bfloat16> h_ptrs;
+            for (int r = 0; r < N; ++r) {
+                h_ptrs.ptr[r] = reinterpret_cast<nv_bfloat16 *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes);
+            }
+            for (int r = 0; r < N; ++r) {
+                ggml_cuda_set_device(p->devices[r]);
+                nv_bfloat16 * data = reinterpret_cast<nv_bfloat16 *>(static_cast<char *>(tensors[r]->data) + off * (int64_t) input_elem_bytes);
+                ggml_cuda_ar_pascal_ddio_16_kernel<N, nv_bfloat16><<<nb, 256, 0, streams[r]>>>(
+                    data, h_ptrs.ptr[r], h_ptrs, arr.ptr[r], arr, chunk_elems, r, compute_flag[r] ? 1 : 0, tok);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+    }
+    return true;
+}
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -775,7 +1828,7 @@ bool ggml_cuda_ar_allreduce(
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
-    GGML_ASSERT(n == 2);
+    GGML_ASSERT(n == 2 || (p->pascal && n == 4));
 
     const ggml_type input_type = tensors[0]->type;
     GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
@@ -785,11 +1838,19 @@ bool ggml_cuda_ar_allreduce(
 
     const size_t   input_nbytes = ggml_nbytes(tensors[0]);
 
-    // Pascal host-staged mode takes the small (decode / MTP verify) exchanges, which are latency
-    // bound. Larger (prefill) ones return false and take the meta backend's peer copy + ADD, which
-    // sends f16-exact partials as f16; GGML_CUDA_AR_HOST_MAX (bytes) moves the cut.
-    if (p->pascal && input_nbytes > p->host_max) {
-        return false;
+    bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
+    for (int i = 0; i < n; ++i) {
+        compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    }
+
+    if (p->pascal) {
+        if (p->pascal_host_max_set && !p->pascal_p2p_pairs && input_nbytes > p->host_max) {
+            return false;
+        }
+        if (n == 2) {
+            return ggml_cuda_ar_pascal_dispatch_n<2>(p, backends, tensors, input_type, ne, input_nbytes, compute_flag);
+        }
+        return ggml_cuda_ar_pascal_dispatch_n<4>(p, backends, tensors, input_type, ne, input_nbytes, compute_flag);
     }
 
     // BF16 round-trip: F32 inputs >= bf16_threshold are converted to BF16 for
@@ -805,11 +1866,6 @@ bool ggml_cuda_ar_allreduce(
     const size_t    type_size   = ggml_type_size(kernel_type);
     GGML_ASSERT(p->buf_bytes >= type_size);
     const size_t    nbytes      = (size_t) ne * type_size;
-
-    bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
-    for (int i = 0; i < n; ++i) {
-        compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
-    }
 
     // Decide between copy-engine and chunked kernel paths based on the working
     // type's actual byte count.  No upper bound: copy_outer slices reductions

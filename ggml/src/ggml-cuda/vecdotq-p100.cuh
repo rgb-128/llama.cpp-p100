@@ -53,6 +53,24 @@ static __device__ __forceinline__ void p100_load_ints_b2(const uint8_t * p, int 
     }
 }
 
+// N consecutive ints from a 1-byte-aligned address: N aligned loads (+1 if misaligned) and a
+// funnel shift each, instead of get_int_b1's four byte loads and three shifts per int.
+template <int N>
+static __device__ __forceinline__ void p100_load_ints_b1(const uint8_t * p, int * out) {
+    const int     mis = (int) ((uintptr_t) p & 3);
+    const int *   w   = (const int *) (p - mis);
+    int r[N + 1];
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+        r[k] = w[k];
+    }
+    r[N] = mis ? w[N] : 0;
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+        out[k] = __funnelshift_r(r[k], r[k + 1], 8*mis);
+    }
+}
+
 // q2_K. Element = dm.x*sc*q - dm.y*m, q in 0..3, one (sc, m) per 16 values.
 //
 // Each weight half is the quant left in place, (v & (3 << 2i)), so it carries a factor 4^i that
@@ -507,12 +525,13 @@ static __device__ __forceinline__ uint32_t p100_prmt(const uint32_t a, const uin
     return r;
 }
 
-// iq4: dot of one int of 8 table indices (as get_int_from_table_16) with q8_1 ints u0 (values
-// 0..3) and u1 (values 16..19 of the group). The two byte-order fixups and dp4a's four weight-side
-// PRMTs are replaced by four sign-extending PRMTs straight from the looked-up bytes, and the
-// selectors are masked once per int instead of once per PRMT (__byte_perm masks every selector).
-static __device__ __forceinline__ int p100_dot_iq4_int(const int q4, const int u0, const int u1, int sumi) {
-    const uint32_t * table32 = (const uint32_t *) kvalues_iq4nl;
+// iq4 / mxfp4: dot of one int of 8 table indices (as get_int_from_table_16) with q8_1 ints u0
+// (values 0..3) and u1 (values 16..19 of the group). The two byte-order fixups and dp4a's four
+// weight-side PRMTs are replaced by four sign-extending PRMTs straight from the looked-up bytes,
+// and the selectors are masked once per int instead of once per PRMT (__byte_perm masks every selector).
+static __device__ __forceinline__ int p100_dot_table16_int(
+    const int q4, const int u0, const int u1, int sumi, const int8_t * table) {
+    const uint32_t * table32 = (const uint32_t *) table;
     const uint32_t qm  = (uint32_t) q4 & 0x77777777;                            // 3-bit table index
     const uint32_t sel = 0x32103210 | (((uint32_t) q4 & 0x88888888) >> 1);      // bit 3: low/high half
     uint32_t t[2];
@@ -533,6 +552,90 @@ static __device__ __forceinline__ int p100_dot_iq4_int(const int q4, const int u
     sumi = p100_mad16x2(x0_1617, y1_01, sumi);
     sumi = p100_mad16x2(x1_1819, y1_23, sumi);
     return sumi;
+}
+
+static __device__ __forceinline__ int p100_dot_iq4_int(const int q4, const int u0, const int u1, int sumi) {
+    return p100_dot_table16_int(q4, u0, u1, sumi, kvalues_iq4nl);
+}
+
+#define VDR_MXFP4_Q8_1_MMVQ_P100 4
+
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_p100(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
+    GGML_UNUSED(iqs);
+
+    int v[4];
+    p100_load_ints_b1<4>(bq4->qs, v);
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sumi = p100_dot_table16_int(v[i], get_int_b4(bq8_1->qs, i), get_int_b4(bq8_1->qs, i + 4), sumi, kvalues_mxfp4);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
+#define VDR_NVFP4_Q8_1_MMVQ_P100 4
+
+static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_p100(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_nvfp4 * bq4 = (const block_nvfp4 *) vbq + kbx;
+    // iqs is 0 (sub-blocks 0,1 -> bq8_1[0]) or 4 (sub-blocks 2,3 -> bq8_1[1]).
+    // sizeof(block_nvfp4) == 36 (4-byte aligned), so bq4->d + is0 is 2-byte aligned and bq4->qs is 4-byte aligned.
+    const int is0 = iqs >> 1;
+    const block_q8_1 * bq8 = bq8_1 + (is0 >> 1);
+    const uint16_t d16 = *(const uint16_t *) (bq4->d + is0);
+
+    int sumi0 = p100_dot_table16_int(get_int_b4(bq4->qs, iqs + 0), get_int_b4(bq8->qs, 0), get_int_b4(bq8->qs, 2), 0,     kvalues_mxfp4);
+    sumi0     = p100_dot_table16_int(get_int_b4(bq4->qs, iqs + 1), get_int_b4(bq8->qs, 1), get_int_b4(bq8->qs, 3), sumi0, kvalues_mxfp4);
+
+    int sumi1 = p100_dot_table16_int(get_int_b4(bq4->qs, iqs + 2), get_int_b4(bq8->qs, 4), get_int_b4(bq8->qs, 6), 0,     kvalues_mxfp4);
+    sumi1     = p100_dot_table16_int(get_int_b4(bq4->qs, iqs + 3), get_int_b4(bq8->qs, 5), get_int_b4(bq8->qs, 7), sumi1, kvalues_mxfp4);
+
+    const float d0 = ggml_cuda_ue4m3_to_fp32((uint8_t) (d16 & 0xFFu));
+    const float d1 = ggml_cuda_ue4m3_to_fp32((uint8_t) (d16 >> 8));
+    return __low2float(bq8->ds) * fmaf(d0, (float) sumi0, d1 * (float) sumi1);
+}
+
+#define VDR_Q2_0_Q8_1_MMVQ_P100 2
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_p100(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_q2_0 * bq2 = (const block_q2_0 *) vbq + kbx;
+    GGML_UNUSED(iqs);
+
+    int q[4];
+    p100_load_ints_b2<4>(bq2->qs, q);
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const block_q8_1 * by = bq8_1 + c;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q16 = (q[2*c + (j >> 1)] >> (16*(j & 1))) & 0xFFFF;
+            // Even/odd 2-bit crumbs mapped to {-1, 0, +1, +2}:
+            // qe = (c0, c2, c4, c6), qo = (c1, c3, c5, c7)
+            const int qe = __byte_perm(0x020100FF, 0x020100FF, q16 >> 0);
+            const int qo = __byte_perm(0x020100FF, 0x020100FF, q16 >> 2);
+            int c02, c46, c13, c57, u02, u13, v02, v13;
+            p100_sext_b01_b23(qe, c02, c46);
+            p100_sext_b01_b23(qo, c13, c57);
+            p100_sext_b02_b13(get_int_b4(by->qs, 2*j + 0), u02, u13);
+            p100_sext_b02_b13(get_int_b4(by->qs, 2*j + 1), v02, v13);
+            sumi = p100_mad16x2(c02, u02, sumi);
+            sumi = p100_mad16x2(c13, u13, sumi);
+            sumi = p100_mad16x2(c46, v02, sumi);
+            sumi = p100_mad16x2(c57, v13, sumi);
+        }
+        sumf += __low2float(by->ds) * (float) sumi;
+    }
+
+    return __half2float(bq2->d) * sumf;
 }
 
 #define VDR_IQ4_NL_Q8_1_MMVQ_P100 4
@@ -575,3 +678,390 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_p100(
     return d * sumi;
 }
 // ---- end leg ---------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// Pascal (sm_60 / sm_61) low-bit I-quants: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M.
+//
+// Generic vecdotq.cuh looks up the 1-8 KB codebooks from global memory on every 4-8 weights
+// (thrashing Pascal's 24 KB L1 TEX cache), emulates __vcmpne4 + __vsub4 for sign application,
+// and runs emulated dp4a on sm_60 (plus redundant dp4a(u, 1) sums in IQ1_M).
+//
+// Here:
+//  1) Each CTA cooperatively stages its codebook once in shared memory using 32-bit Bank-Split
+//     SoA (lo[] + hi[] for 64-bit IQ2 tables so 32-bit LDS never hits 2-way 64-bit bank
+//     conflicts, and flat uint32_t[] for IQ3/IQ1).
+//  2) All IQ2/IQ3 grid bytes are strictly in [1, 62] (never zero), so branchless sign-apply
+//     `w8 = (g ^ m8) + (m8 & 0x01010101u)` is exact two's-complement per byte with zero
+//     cross-byte carry, built in 1 XMAD + 1 PRMT instead of emulated __vcmpne4 + __vsub4.
+//  3) On sm_60, signed 16-bit halves feed p100_mad16x2 (XMAD); on sm_61, hardware __dp4a is
+//     used directly. IQ1_S/IQ1_M reuse p100_k45_y's nibble-in-place XMADs (and get IQ1_M's
+//     activation sum for free from the unpacked halves). All integer sums are 100% bit-exact.
+
+static constexpr __host__ __device__ bool p100_iq_type(ggml_type type) {
+    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS  || type == GGML_TYPE_IQ2_S ||
+           type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S   ||
+           type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_IQ1_M;
+}
+
+template <ggml_type type>
+struct p100_iq_lut {
+    static constexpr bool active = false;
+    __device__ __forceinline__ void load(int, int) {}
+};
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 600 || __CUDA_ARCH__ == 610)
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ2_XXS> {
+    static constexpr bool active = true;
+    uint32_t lo[256];
+    uint32_t hi[256];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        const uint2 * src = (const uint2 *) iq2xxs_grid;
+        for (int i = tid; i < 256; i += nthreads) {
+            const uint2 v = __ldg(src + i);
+            lo[i] = v.x;
+            hi[i] = v.y;
+        }
+        __syncthreads();
+    }
+};
+
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ2_XS> {
+    static constexpr bool active = true;
+    uint32_t lo[512];
+    uint32_t hi[512];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        const uint2 * src = (const uint2 *) iq2xs_grid;
+        for (int i = tid; i < 512; i += nthreads) {
+            const uint2 v = __ldg(src + i);
+            lo[i] = v.x;
+            hi[i] = v.y;
+        }
+        __syncthreads();
+    }
+};
+
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ2_S> {
+    static constexpr bool active = true;
+    uint32_t lo[1024];
+    uint32_t hi[1024];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        const uint2 * src = (const uint2 *) iq2s_grid;
+        for (int i = tid; i < 1024; i += nthreads) {
+            const uint2 v = __ldg(src + i);
+            lo[i] = v.x;
+            hi[i] = v.y;
+        }
+        __syncthreads();
+    }
+};
+
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ3_XXS> {
+    static constexpr bool active = true;
+    uint32_t g[256];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        for (int i = tid; i < 256; i += nthreads) {
+            g[i] = __ldg(iq3xxs_grid + i);
+        }
+        __syncthreads();
+    }
+};
+
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ3_S> {
+    static constexpr bool active = true;
+    uint32_t g[512];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        for (int i = tid; i < 512; i += nthreads) {
+            g[i] = __ldg(iq3s_grid + i);
+        }
+        __syncthreads();
+    }
+};
+
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ1_S> {
+    static constexpr bool active = true;
+    uint32_t g[NGRID_IQ1S];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        for (int i = tid; i < NGRID_IQ1S; i += nthreads) {
+            g[i] = __ldg(iq1s_grid_gpu + i);
+        }
+        __syncthreads();
+    }
+};
+
+template <>
+struct p100_iq_lut<GGML_TYPE_IQ1_M> {
+    static constexpr bool active = true;
+    uint32_t g[NGRID_IQ1S];
+    __device__ __forceinline__ void load(int tid, int nthreads) {
+        for (int i = tid; i < NGRID_IQ1S; i += nthreads) {
+            g[i] = __ldg(iq1s_grid_gpu + i);
+        }
+        __syncthreads();
+    }
+};
+#endif // __CUDA_ARCH__ == 600 || __CUDA_ARCH__ == 610
+
+// 7-bit parity-encoded sign byte -> exact 8-bit sign byte (ksigns_iq2xs[v & 127]), zero memory ops.
+static __device__ __forceinline__ uint32_t p100_iq_ksign8(const uint32_t v) {
+    const uint32_t v7 = v & 0x7Fu;
+    return v7 | ((__popc(v7) & 1u) << 7);
+}
+
+// Signed dot of 4 strictly-positive grid bytes g in [1, 62] with 4 sign bits (s4 & 0xF) against
+// 4 signed int8 activations u. Exact integer arithmetic on both sm_60 (XMAD) and sm_61 (__dp4a).
+static __device__ __forceinline__ int p100_iq_dot4_signed(const uint32_t g, const uint32_t s4, const int u, int sumi) {
+    // Spread bits 0..3 into byte MSBs (bits 7, 15, 23, 31) with zero cross-byte carry.
+    const uint32_t sb = (s4 & 0xFu) * 0x10204080u;
+    uint32_t m8;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m8) : "r"(sb));
+    // Every byte of g is >= 1, so (g ^ m8) + (m8 & 0x01010101u) never carries across bytes.
+    const int w8 = (int) ((g ^ m8) + (m8 & 0x01010101u));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(w8, u, sumi);
+#else
+    int w02, w13, y02, y13;
+    p100_sext_b02_b13(w8, w02, w13);
+    p100_sext_b02_b13(u,  y02, y13);
+    sumi = p100_mad16x2(w02, y02, sumi);
+    sumi = p100_mad16x2(w13, y13, sumi);
+    return sumi;
+#endif
+}
+
+template <ggml_type type>
+static __device__ __forceinline__ float p100_iq_vec_dot(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx, const int & iqs, const p100_iq_lut<type> & lut) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 600 || __CUDA_ARCH__ == 610)
+    if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
+        const uint32_t q2    = (uint32_t) get_int_b2(bq2->qs, iqs);
+        const uint32_t aux32 = (uint32_t) get_int_b2(bq2->qs, iqs + 1);
+        const int8_t * yqs   = bq8_1[iqs/2].qs;
+
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t idx = (q2 >> (8*l)) & 0xFFu;
+            const uint32_t g0  = lut.lo[idx];
+            const uint32_t g1  = lut.hi[idx];
+            const uint32_t sg  = p100_iq_ksign8(aux32 >> (7*l));
+            sumi = p100_iq_dot4_signed(g0, sg,      get_int_b4(yqs, 2*l + 0), sumi);
+            sumi = p100_iq_dot4_signed(g1, sg >> 4, get_int_b4(yqs, 2*l + 1), sumi);
+        }
+
+        const int ls = (int) ((aux32 >> 27) | 1u);
+        sumi = sumi * ls / 8;
+        const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+        return d * sumi;
+    } else if constexpr (type == GGML_TYPE_IQ2_XS) {
+        const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq + kbx;
+        const uint32_t q2_0 = (uint32_t) get_int_b2(bq2->qs, iqs + 0);
+        const uint32_t q2_1 = (uint32_t) get_int_b2(bq2->qs, iqs + 1);
+        const int sc = bq2->scales[iqs/2];
+        const int ls0 = sc & 0x0F;
+        const int ls1 = sc >> 4;
+        const int8_t * yqs = bq8_1[iqs/2].qs;
+
+        int sumi0 = 0;
+        int sumi1 = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t q   = ((l < 2 ? q2_0 : q2_1) >> (16*(l & 1))) & 0xFFFFu;
+            const uint32_t idx = q & 0x1FFu;
+            const uint32_t g0  = lut.lo[idx];
+            const uint32_t g1  = lut.hi[idx];
+            const uint32_t sg  = p100_iq_ksign8(q >> 9);
+            const int u0 = get_int_b4(yqs, 2*l + 0);
+            const int u1 = get_int_b4(yqs, 2*l + 1);
+            if (l < 2) {
+                sumi0 = p100_iq_dot4_signed(g0, sg,      u0, sumi0);
+                sumi0 = p100_iq_dot4_signed(g1, sg >> 4, u1, sumi0);
+            } else {
+                sumi1 = p100_iq_dot4_signed(g0, sg,      u0, sumi1);
+                sumi1 = p100_iq_dot4_signed(g1, sg >> 4, u1, sumi1);
+            }
+        }
+
+        const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+        const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+        return d * sumi;
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+        const uint32_t qs_packed    = (uint32_t) get_int_b2(bq2->qs, iqs/2);
+        const uint32_t signs_packed = (uint32_t) get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+        const uint32_t qh = bq2->qh[iqs/2];
+        const int sc = bq2->scales[iqs/2];
+        const int ls0 = sc & 0x0F;
+        const int ls1 = sc >> 4;
+        const int8_t * yqs = bq8_1[iqs/2].qs;
+
+        int sumi0 = 0;
+        int sumi1 = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t idx = ((qs_packed >> (8*l)) & 0xFFu) | ((qh << (8 - 2*l)) & 0x300u);
+            const uint32_t g0  = lut.lo[idx];
+            const uint32_t g1  = lut.hi[idx];
+            const uint32_t sg  = (signs_packed >> (8*l)) & 0xFFu;
+            const int u0 = get_int_b4(yqs, 2*l + 0);
+            const int u1 = get_int_b4(yqs, 2*l + 1);
+            if (l < 2) {
+                sumi0 = p100_iq_dot4_signed(g0, sg,      u0, sumi0);
+                sumi0 = p100_iq_dot4_signed(g1, sg >> 4, u1, sumi0);
+            } else {
+                sumi1 = p100_iq_dot4_signed(g0, sg,      u0, sumi1);
+                sumi1 = p100_iq_dot4_signed(g1, sg >> 4, u1, sumi1);
+            }
+        }
+
+        const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+        const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+        return d * sumi;
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+        const uint32_t q3_0  = (uint32_t) get_int_b2(bq3->qs, iqs + 0);
+        const uint32_t q3_1  = (uint32_t) get_int_b2(bq3->qs, iqs + 1);
+        const uint32_t aux32 = (uint32_t) get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+        const int8_t * yqs   = bq8_1[iqs/2].qs;
+
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qw = ((l < 2 ? q3_0 : q3_1) >> (16*(l & 1))) & 0xFFFFu;
+            const uint32_t g0 = lut.g[qw & 0xFFu];
+            const uint32_t g1 = lut.g[qw >> 8];
+            const uint32_t sg = p100_iq_ksign8(aux32 >> (7*l));
+            sumi = p100_iq_dot4_signed(g0, sg,      get_int_b4(yqs, 2*l + 0), sumi);
+            sumi = p100_iq_dot4_signed(g1, sg >> 4, get_int_b4(yqs, 2*l + 1), sumi);
+        }
+
+        const int ls = (int) (aux32 >> 28);
+        sumi = (ls*sumi + sumi/2)/2;
+        const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+        return d * sumi;
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+        const uint32_t qs_0  = (uint32_t) get_int_b2(bq3->qs, iqs + 0);
+        const uint32_t qs_1  = (uint32_t) get_int_b2(bq3->qs, iqs + 1);
+        const uint32_t qh    = bq3->qh[iqs/2];
+        const uint32_t signs_packed = (uint32_t) get_int_b2(bq3->signs, iqs/2);
+        const int8_t * yqs   = bq8_1[iqs/2].qs;
+
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qw   = ((l < 2 ? qs_0 : qs_1) >> (16*(l & 1))) & 0xFFFFu;
+            const uint32_t idx0 = (qw & 0xFFu) | ((qh << (8 - 2*l)) & 0x100u);
+            const uint32_t idx1 = (qw >> 8)    | ((qh << (7 - 2*l)) & 0x100u);
+            const uint32_t g0   = lut.g[idx0];
+            const uint32_t g1   = lut.g[idx1];
+            const uint32_t sg   = (signs_packed >> (8*l)) & 0xFFu;
+            sumi = p100_iq_dot4_signed(g0, sg,      get_int_b4(yqs, 2*l + 0), sumi);
+            sumi = p100_iq_dot4_signed(g1, sg >> 4, get_int_b4(yqs, 2*l + 1), sumi);
+        }
+
+        sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+        return d * sumi;
+    } else if constexpr (type == GGML_TYPE_IQ1_S) {
+        const block_iq1_s * bq1 = (const block_iq1_s *) vbq + kbx;
+        const uint32_t qs_packed = (uint32_t) get_int_b2(bq1->qs, iqs);
+        const uint32_t qh = bq1->qh[iqs];
+        const int8_t * yqs = bq8_1[iqs].qs;
+
+        int sumi = 0;
+#if __CUDA_ARCH__ >= 610
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int grid = (int) lut.g[((qs_packed >> (8*l)) & 0xFFu) | (((qh >> (3*l)) & 0x07u) << 8)];
+            sumi = __dp4a( grid       & 0x0F0F0F0F, get_int_b4(yqs, 2*l + 0), sumi);
+            sumi = __dp4a((grid >> 4) & 0x0F0F0F0F, get_int_b4(yqs, 2*l + 1), sumi);
+        }
+#else
+        int acc256 = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int grid = (int) lut.g[((qs_packed >> (8*l)) & 0xFFu) | (((qh >> (3*l)) & 0x07u) << 8)];
+            int a02, a13, b02, b13;
+            p100_k45_y(get_int_b4(yqs, 2*l + 0), a02, a13);
+            p100_k45_y(get_int_b4(yqs, 2*l + 1), b02, b13);
+            acc256 = p100_mad16x2(grid & 0x000F000F, a02, acc256);
+            acc256 = p100_mad16x2(grid & 0x0F000F00, a13, acc256);
+            const int g1 = grid >> 4;
+            acc256 = p100_mad16x2(g1 & 0x000F000F, b02, acc256);
+            acc256 = p100_mad16x2(g1 & 0x0F000F00, b13, acc256);
+        }
+        sumi = acc256 >> 8;
+#endif
+        const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0Eu) + 1u);
+        const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000u) * (2.0f*IQ1S_DELTA/0x8000);
+        const float2 ds    = __half22float2(bq8_1[iqs].ds);
+        return d1q * (ds.x*sumi + ds.y*delta);
+    } else if constexpr (type == GGML_TYPE_IQ1_M) {
+        const block_iq1_m * bq1 = (const block_iq1_m *) vbq + kbx;
+        const uint32_t qs_packed = (uint32_t) get_int_b4(bq1->qs, iqs);
+        const int8_t * yqs = bq8_1[iqs].qs;
+
+        int   sumi[2] = { 0, 0 };
+        float sumf[2] = { 0.0f, 0.0f };
+#if __CUDA_ARCH__ >= 610
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qhl = bq1->qh[2*iqs + (l >> 1)] >> (4*(l & 1));
+            const int grid = (int) lut.g[((qs_packed >> (8*l)) & 0xFFu) | ((qhl & 0x07u) << 8)];
+            const int u0 = get_int_b4(yqs, 2*l + 0);
+            const int u1 = get_int_b4(yqs, 2*l + 1);
+            sumi[l >> 1] = __dp4a( grid       & 0x0F0F0F0F, u0, sumi[l >> 1]);
+            sumi[l >> 1] = __dp4a((grid >> 4) & 0x0F0F0F0F, u1, sumi[l >> 1]);
+            const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08u) * (2.0f*IQ1M_DELTA/0x08);
+            const int sumy = __dp4a(u1, 0x01010101, __dp4a(u0, 0x01010101, 0));
+            sumf[l >> 1] += delta * (float) sumy;
+        }
+#else
+        int acc256[2] = { 0, 0 };
+        int sumd8[2]  = { 0, 0 };
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qhl = bq1->qh[2*iqs + (l >> 1)] >> (4*(l & 1));
+            const int grid = (int) lut.g[((qs_packed >> (8*l)) & 0xFFu) | ((qhl & 0x07u) << 8)];
+            int a02, a13, b02, b13;
+            p100_k45_y(get_int_b4(yqs, 2*l + 0), a02, a13);
+            p100_k45_y(get_int_b4(yqs, 2*l + 1), b02, b13);
+            acc256[l >> 1] = p100_mad16x2(grid & 0x000F000F, a02, acc256[l >> 1]);
+            acc256[l >> 1] = p100_mad16x2(grid & 0x0F000F00, a13, acc256[l >> 1]);
+            const int g1 = grid >> 4;
+            acc256[l >> 1] = p100_mad16x2(g1 & 0x000F000F, b02, acc256[l >> 1]);
+            acc256[l >> 1] = p100_mad16x2(g1 & 0x0F000F00, b13, acc256[l >> 1]);
+            // Exact activation sum for 8 int8 values directly from already-unpacked halves;
+            // IQ1M_DELTA = 0.125 so (-1 +/- 0.125) = (-9 or -7) / 8 (exact integer).
+            const int t  = ((a02 ^ 0x8000) >> 8) + (a13 ^ 0x8000) + ((b02 ^ 0x8000) >> 8) + (b13 ^ 0x8000) - 2*(0x8000 + 0x80);
+            const int lo = (t << 16) >> 16;
+            const int sumy = lo + ((t - lo) >> 16);
+            sumd8[l >> 1] += ((qhl & 0x08u) ? -9 : -7) * sumy;
+        }
+        sumi[0] = acc256[0] >> 8;
+        sumi[1] = acc256[1] >> 8;
+        sumf[0] = 0.125f * (float) sumd8[0];
+        sumf[1] = 0.125f * (float) sumd8[1];
+#endif
+        const uint16_t * sc = (const uint16_t *) bq1->scales;
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d = __half2float(scale.f16) * __low2float(bq8_1[iqs].ds);
+
+        const int tmp = sc[iqs/2] >> (6*(iqs%2));
+        const int sc0 = 2*((tmp >> 0) & 0x07) + 1;
+        const int sc1 = 2*((tmp >> 3) & 0x07) + 1;
+        return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+    }
+#endif
+    GGML_UNUSED_VARS(vbq, bq8_1, kbx, iqs, lut);
+    return 0.0f;
+}
